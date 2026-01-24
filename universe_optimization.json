@@ -8,16 +8,16 @@
     "ADA/USDT:USDT",
     "DOGE/USDT:USDT",
     "LINK/USDT:USDT",
-    "ALPACA/USDT:USDT",
     "RIVER/USDT:USDT",
     "AXS/USDT:USDT",
-    "BNX/USDT:USDT",
+    "ENSO/USDT:USDT",
     "0G/USDT:USDT",
-    "ENSO/USDT:USDT"
+    "ZEC/USDT:USDT",
+    "1000PEPE/USDT:USDT"
   ],
   "meta": {
     "policy": "core8+sat6",
     "days": 30,
-    "ts": 1769231930
+    "ts": 1769259946
   }
 }

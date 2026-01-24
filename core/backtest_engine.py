@@ -143,9 +143,9 @@ class BacktestEngine:
     def rebuild_indicators(self):
         """
         [Fix 핵심]
-        - ema_daily 같은 '옵션 컬럼'이 NaN이어도 심볼이 죽지 않게 한다.
         - dropna()는 '필수 컬럼 subset' 기준으로만 적용한다.
         - 워밍업(warmup)은 각 필수 컬럼의 첫 유효시점 중 '가장 늦은 시점'을 사용한다.
+        - 심볼별 warmup으로 슬라이스 (global_warmup 제거)
         """
         self.data_map = {}
 
@@ -156,7 +156,7 @@ class BacktestEngine:
         ]
 
         temp_map = {}
-        global_warmup = 0
+        warmup_map = {}  # sym -> sym_warmup
 
         # 1) 심볼별 지표 계산 + 심볼별 warmup 계산
         for sym, df in self.raw_data_map.items():
@@ -172,6 +172,11 @@ class BacktestEngine:
                     logger.warning(f"[Indicator] {sym} required columns all-NaN (pre-slice).")
                     continue
 
+                bad_cols = [c for c in required_cols if ind[c].isna().all()]
+                if bad_cols:
+                    logger.warning(f"[Indicator] {sym} has all-NaN required cols (pre-slice): {bad_cols}")
+                    continue
+
                 col_warmups = []
                 for c in required_cols:
                     s = ind[c]
@@ -185,22 +190,24 @@ class BacktestEngine:
                             col_warmups.append(0)
 
                 sym_warmup = int(max(col_warmups)) if col_warmups else 0
-                global_warmup = max(global_warmup, sym_warmup)
 
                 temp_map[sym] = ind
+                warmup_map[sym] = sym_warmup
 
             except Exception as e:
                 logger.warning(f"[Indicator] {sym} indicator failed: {e}")
 
-        # 2) 모든 심볼을 동일 warmup 이후로 슬라이스 + required subset 기준 dropna
+        # 2) 심볼별 warmup 이후로 슬라이스 + required subset 기준 dropna
         for sym, ind in temp_map.items():
             try:
-                sliced = ind.iloc[global_warmup:].copy()
+                sym_warmup = int(warmup_map.get(sym, 0))
+                sliced = ind.iloc[sym_warmup:].copy()
+
                 if len(sliced) == 0:
                     logger.warning(f"[Indicator] {sym} empty after slice")
                     continue
 
-                # ✅ dropna는 required subset에만 적용 (ema_daily NaN은 허용)
+                # ✅ dropna는 required subset에만 적용 (옵션 컬럼 NaN은 허용)
                 sliced = sliced.dropna(subset=required_cols)
                 if len(sliced) == 0:
                     logger.warning(f"[Indicator] {sym} all NaN after drop (required subset)")
@@ -257,10 +264,28 @@ class BacktestEngine:
                 common_timeline = common_timeline.intersection(idx)
 
         if common_timeline is None or len(common_timeline) < 200:
-            logger.error("Not enough synchronized data (common timeline too short).")
-            return
+            logger.error("Not enough synchronized data (common timeline too short). Fallback to base timeline.")
 
-        timeline = common_timeline
+            # ✅ Fallback: max_start 이후 데이터가 가장 긴 심볼을 선택
+            base_sym = None
+            base_len = -1
+            for s in fixed_symbols:
+                df = self.data_map.get(s)
+                if df is None or df.empty:
+                    continue
+                l = len(df.index[df.index >= max_start])
+                if l > base_len or (l == base_len and (base_sym is None or s < base_sym)):
+                    base_len = l
+                    base_sym = s
+
+            if base_sym is None or base_len < 250:
+                logger.error("❌ Fallback timeline too short. Abort.")
+                return
+
+            # ✅ 중요: fallback에서는 max_start로 또 자르면 타임라인이 과도하게 줄 수 있으므로 전체 index를 사용
+            timeline = self.data_map[base_sym].index
+        else:
+            timeline = common_timeline
 
         # [Reset]
         self.executor.history = []
@@ -272,6 +297,9 @@ class BacktestEngine:
         self.consecutive_losses = {}
 
         sim_times = timeline[200:]
+        if len(sim_times) < 200:
+            logger.error(f"❌ Not enough simulation steps after warmup: {len(sim_times)}")
+            return
 
         for current_time in sim_times:
             # Step 1: 포지션 관리
@@ -285,6 +313,18 @@ class BacktestEngine:
                 current_prices[sym] = curr_row['close']
 
                 if sym in self.executor.positions:
+                    # ✅ PATCH: 다음 캔들부터 SL 적용 (캔들 내 순서 모순 제거)
+                    pos = self.executor.positions[sym]
+                    if 'next_sl' in pos and pos['next_sl'] is not None:
+                        try:
+                            if float(pos['next_sl']) != float(pos.get('sl', 0)):
+                                pos['sl'] = float(pos['next_sl'])
+                        except Exception:
+                            # 숫자 변환 실패 시 안전하게 스킵
+                            pass
+                        # 적용 후 제거 (단일 진실 유지)
+                        pos.pop('next_sl', None)
+
                     self._process_existing_position(sym, curr_row, None)
 
             # Step 2: 신규 진입 후보
@@ -382,6 +422,7 @@ class BacktestEngine:
                     'margin': margin_required,
                     'sl': sl,
                     'tp1': tp,
+                    'next_sl': None,    
                     'tp1_hit': False,
                     'entry_time': curr_row.name
                 }
@@ -399,8 +440,16 @@ class BacktestEngine:
 
         action, exec_price, reason, new_sl = self.monitor.check_conditions(sym, pos, market_data)
 
-        if new_sl != pos['sl']:
-            pos['sl'] = new_sl
+        # ✅ PATCH: SL 갱신은 "다음 캔들"에만 적용한다.
+        # - PositionMonitor는 new_sl을 계산하지만, 이번 캔들 히트 판정은 current_sl로 이미 끝났다는 전제
+        # - 따라서 new_sl은 next_sl로 예약만 한다.
+        if action == 'UPDATE_SL':
+            try:
+                if new_sl is not None and float(new_sl) != float(pos.get('sl', 0)):
+                    pos['next_sl'] = float(new_sl)
+            except Exception:
+                # 숫자 변환 실패 시 예약하지 않음
+                pass
 
         if action == 'TP1':
             close_amt = pos['amount'] * 0.5

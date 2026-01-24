@@ -13,7 +13,6 @@ DEFAULT_CORE_N = 8
 DEFAULT_SATELLITE_N = 6
 
 # 유니버스에서 원천 배제하고 싶은 기초자산(현물/스테이블/금은/지표성 등)
-# - 네 의도: "썩은 코인" + "이상한 코인" + "코모디티/스테이블" 최대 배제
 DEFAULT_EXCLUDE_BASE_ASSETS = {
     "USDC",
     "FDUSD",
@@ -28,7 +27,6 @@ DEFAULT_EXCLUDE_BASE_ASSETS = {
 
 # 심볼 유효성: 영문/숫자만 허용
 # 예: BTC/USDT:USDT, 1000SHIB/USDT:USDT OK
-# 예: 我踏马来了/USDT:USDT 같은 것 차단
 _VALID_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}/USDT(?::USDT)?$")
 
 
@@ -58,7 +56,14 @@ def _get_exchange_from_executor(executor) -> Any:
     없으면 public 모드 ccxt.binance futures 생성.
     """
     ex = getattr(executor, "exchange", None) if executor is not None else None
+
     if ex is not None:
+        # ✅ markets가 비어 있거나 로드가 안 되어 있으면 보강 로드
+        try:
+            if not getattr(ex, "markets", None):
+                ex.load_markets()
+        except Exception as e:
+            logger.warning(f"[Universe] load_markets failed (reuse): {e}")
         return ex
 
     import ccxt
@@ -73,6 +78,19 @@ def _get_exchange_from_executor(executor) -> Any:
     except Exception as e:
         logger.warning(f"[Universe] load_markets failed: {e}")
     return ex
+
+
+def _symbol_variants(symbol: str) -> List[str]:
+    """
+    CCXT/환경에 따라 ':USDT' 유무가 섞일 수 있어 둘 다 시도.
+    """
+    if not isinstance(symbol, str):
+        return []
+    if symbol.endswith(":USDT"):
+        return [symbol, symbol.split(":")[0]]
+    if symbol.endswith("/USDT"):
+        return [symbol, symbol + ":USDT"]
+    return [symbol]
 
 
 def _is_usdt_perp_symbol(symbol: str) -> bool:
@@ -125,11 +143,75 @@ def _choose_core_symbols(tickers: Dict[str, Dict[str, Any]], core_assets: List[s
     return out
 
 
+# =========================================================
+# ✅ NEW: 상폐/비활성(거래불가) 심볼 필터
+# =========================================================
+def _market_is_tradeable_usdtm_perp(ex, symbol: str) -> bool:
+    """
+    ✅ 상폐/비활성/거래불가를 '마켓 메타'로 1차 차단.
+    - active=False면 제외
+    - contract/future 계열이 아니면 제외 (USDT-M 선물만)
+    - quote가 USDT가 아니면 제외
+    """
+    try:
+        markets = getattr(ex, "markets", None) or {}
+        for sym in _symbol_variants(symbol):
+            m = markets.get(sym)
+            if not isinstance(m, dict):
+                continue
+
+            # 1) active 체크
+            if m.get("active") is False:
+                return False
+
+            # 2) 선물/컨트랙트 성격 확인 (CCXT 표준 키들)
+            contract = bool(m.get("contract", False)) or bool(m.get("future", False)) or (m.get("type") == "future")
+            if not contract:
+                return False
+
+            # 3) USDT-M(선형) 확인
+            linear = m.get("linear", None)
+            if linear is False:
+                return False
+
+            # quote가 명시되어 있으면 USDT만 통과
+            quote = str(m.get("quote", "")).upper()
+            if quote and quote != "USDT":
+                return False
+
+            return True
+
+        # markets에 없으면 보수적으로 False (잔재 티커 섞이는 케이스 차단)
+        return False
+    except Exception:
+        return False
+
+
+def _has_minimum_ohlcv(ex, symbol: str, timeframe: str, min_rows: int) -> bool:
+    """
+    ✅ 티커 잔재/상폐 잔존 제거 2차 필터:
+    - 최소 min_rows(기본 50)라도 OHLCV가 받아져야 유니버스 후보로 인정
+    """
+    def _try(sym: str) -> Optional[int]:
+        try:
+            limit = max(50, int(min_rows))
+            ohlcv = ex.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+            return len(ohlcv) if ohlcv is not None else 0
+        except Exception:
+            return None
+
+    for sym in _symbol_variants(symbol):
+        n = _try(sym)
+        if n is not None and n >= min_rows:
+            return True
+    return False
+
+
 def _has_enough_ohlcv(ex, symbol: str, timeframe: str, min_rows: int) -> bool:
     """
     현실적 데이터 필터:
     - 여기서의 min_rows는 "최근 N개 캔들"이 돌아오는지로 검증
-    - 핵심: 검증 실패가 많을 때(30일 모드에서 특히) '심볼 형식 차이'를 함께 시도한다.
+    - 검증 실패가 많을 때(30일 모드에서 특히) '심볼 형식 차이'를 함께 시도한다.
       (ex: 'AAA/USDT:USDT' vs 'AAA/USDT')
     """
     def _try(sym: str) -> Optional[int]:
@@ -174,6 +256,8 @@ def get_universe(
     exclude_base_assets: Optional[Set[str]] = None,
     # ✅ 핵심: 30일 모드에서 위성이 0개로 붕괴하는 것을 방지하는 "점진 완화" 옵션
     relax_ohlcv_if_insufficient: bool = True,
+    # ✅ NEW: 상폐/잔재 차단 최소 OHLCV 요구 (validate_ohlcv와 무관하게 항상 적용)
+    min_survival_ohlcv_rows: int = 50,
 ) -> List[str]:
     """
     [Phalanx Universe Policy]
@@ -181,12 +265,10 @@ def get_universe(
     - Core 8: BTC, ETH, SOL, BNB, XRP, ADA, DOGE, LINK
     - Satellite 6: 필터 통과한 거래대금 상위
 
-    위성 확보 정책(의도대로 동작하게 만드는 핵심):
-    1) 가능한 한 validate_ohlcv + min_ohlcv_rows로 엄격하게 채움
-    2) 그래도 위성이 부족하면(30일 모드에서 흔함):
-       - min_ohlcv_rows를 800 -> 600 -> 400 으로 점진 완화 (validate 유지)
-    3) 그래도 부족하면 마지막으로 validate_ohlcv를 끄고(거래대금+클린심볼+배제목록은 유지)
-       위성 슬롯을 "반드시" 채운다.
+    ✅ NEW (상폐/비활성 필터)
+    - validate_ohlcv를 꺼도 "상폐/비활성/거래불가" 심볼은 절대 유니버스에 들어오지 않게 차단한다.
+      1) load_markets 기반 tradeable(usdt-m perp) 체크
+      2) 최소 OHLCV(min_survival_ohlcv_rows) 생존성 체크
     """
     if top_n != (core_n + satellite_n):
         top_n = core_n + satellite_n
@@ -210,6 +292,8 @@ def get_universe(
 
     core_symbols: List[str] = []
     removed_core_bl = 0
+    core_dead_removed = 0
+
     for s in core_symbols_all:
         if s in bl or s.split(":")[0] in bl:
             removed_core_bl += 1
@@ -218,6 +302,17 @@ def get_universe(
             continue
         if _is_excluded_base(s, exclude_bases):
             continue
+
+        # ✅ 상폐/비활성/비거래 필터 (항상 적용)
+        if not _market_is_tradeable_usdtm_perp(ex, s):
+            core_dead_removed += 1
+            continue
+
+        # ✅ 티커 잔재 제거: 최소 OHLCV 생존성 체크 (항상 적용)
+        if not _has_minimum_ohlcv(ex, s, timeframe=timeframe, min_rows=int(min_survival_ohlcv_rows)):
+            core_dead_removed += 1
+            continue
+
         core_symbols.append(s)
         if len(core_symbols) >= core_n:
             break
@@ -226,6 +321,8 @@ def get_universe(
     # 2) 위성 후보 풀 구성
     # -----------------------------
     ranked: List[Tuple[str, float]] = []
+    sat_dead_removed = 0
+
     for sym, t in tickers.items():
         if not _is_usdt_perp_symbol(sym):
             continue
@@ -236,6 +333,16 @@ def get_universe(
         if sym in core_symbols:
             continue
         if _is_excluded_base(sym, exclude_bases):
+            continue
+
+        # ✅ 상폐/비활성/비거래 필터 (항상 적용)
+        if not _market_is_tradeable_usdtm_perp(ex, sym):
+            sat_dead_removed += 1
+            continue
+
+        # ✅ 티커 잔재 제거: 최소 OHLCV 생존성 체크 (항상 적용)
+        if not _has_minimum_ohlcv(ex, sym, timeframe=timeframe, min_rows=int(min_survival_ohlcv_rows)):
+            sat_dead_removed += 1
             continue
 
         try:
@@ -283,7 +390,8 @@ def get_universe(
                 if len(satellites) >= satellite_n:
                     break
 
-            # ✅ 그래도 부족하면 "마지막 보루": validate 끄고 채움 (거래대금/클린/배제/블랙리스트는 그대로)
+            # ✅ 그래도 부족하면 "마지막 보루": validate 끄고 채움
+            # (단, ranked 자체가 이미 "상폐/비활성+티커잔재" 필터를 통과한 것만 남아있음)
             if len(satellites) < satellite_n:
                 more, _sk = _fill_satellites_with_rows_threshold(rows_threshold=0, do_validate=False)
                 satellites = more[:satellite_n]
@@ -299,8 +407,8 @@ def get_universe(
 
     logger.info(
         f"[Universe] Policy core={len(core_symbols)}/{core_n}, sat={len(satellites)}/{satellite_n}, "
-        f"total={len(universe)}/{top_n}, core_bl_removed={removed_core_bl}, "
-        f"sat_ohlcv_skipped={skipped_ohlcv}, scanned={len(ranked)}"
+        f"total={len(universe)}/{top_n}, core_bl_removed={removed_core_bl}, sat_ohlcv_skipped={skipped_ohlcv}, "
+        f"dead_removed_core={core_dead_removed}, dead_removed_sat={sat_dead_removed}, scanned={len(ranked)}"
     )
 
     if len(universe) < top_n:

@@ -104,63 +104,150 @@ class VirtualExecutor:
         return self.equity
 
     def get_top_targets(self):
-        # (기존 ccxt 로직 유지)
+        """
+        거래대금 상위 종목을 뽑되,
+        - 선물 USDT perpetual
+        - markets에서 active 아닌 심볼은 제외(상폐/정지/비활성 방지)
+        ※ 어떤 상황에서도 'None'을 반환하지 않고, 항상 list를 반환한다.
+        """
         import ccxt
-        exchange = ccxt.binance({'options': {'defaultType': 'future'}})
+
+        exchange = ccxt.binance({
+            'enableRateLimit': True,
+            'timeout': 20000,  # ✅ 무한대기 방지
+            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+        })
+
+        # ✅ markets 로딩은 "시도"만 하고 실패해도 진행 (active filter는 가능한 범위에서만)
+        try:
+            exchange.load_markets()
+        except Exception as e:
+            print(f"    ⚠️ load_markets failed (continue without full market filter): {e}")
+
+        # ✅ ticker 조회 실패 시도 대비: 무조건 list 반환
         try:
             tickers = exchange.fetch_tickers()
-            targets = []
-            for s in tickers:
-                if '/USDT:USDT' in s:
-                    vol = tickers[s].get('quoteVolume', 0)
-                    if vol > 0:
-                        targets.append((s, vol))
-            targets.sort(key=lambda x: x[1], reverse=True)
-            return [t[0] for t in targets][:20]
-        except:
-            return []
+        except Exception as e:
+            print(f"    ❌ fetch_tickers failed: {e}")
+            return []  # <-- 핵심: None 반환 금지
 
-    def prepare_data(self, symbols, days=180):
+        markets = getattr(exchange, "markets", None)
+        if not isinstance(markets, dict):
+            markets = {}
+
+        targets = []
+        for s, t in (tickers or {}).items():
+            if '/USDT:USDT' not in s:
+                continue
+
+            # ✅ 상폐/정지/비활성 마켓 제외 (markets 정보가 있을 때만)
+            m = markets.get(s)
+            if isinstance(m, dict):
+                if m.get('active') is False:
+                    continue
+                info = m.get('info')
+                if isinstance(info, dict):
+                    status = str(info.get('status', '')).upper()
+                    # 바이낸스는 보통 TRADING이 정상
+                    if status and status not in ('TRADING', '1'):
+                        continue
+
+            vol = 0.0
+            if isinstance(t, dict):
+                vol = t.get('quoteVolume', 0) or 0
+
+            try:
+                vol = float(vol)
+            except Exception:
+                vol = 0.0
+
+            if vol > 0:
+                targets.append((s, vol))
+
+        targets.sort(key=lambda x: x[1], reverse=True)
+        return [t[0] for t in targets][:20]  # <-- 항상 list
+
+    def prepare_data(self, symbols, days=30):
         # (기존 데이터 다운로드 로직 유지)
         import ccxt
         import time
         import pandas as pd  # 데이터프레임 변환용 추가
 
         exchange = ccxt.binance({'options': {'defaultType': 'future'}})
+
+        # ✅ markets 미로딩 상태면 active/status 필터가 아예 안 돌아가서 이상한 심볼로 터질 수 있음
+        #    실패해도 진행 (이 함수도 절대 None을 반환하지 않음)
+        try:
+            exchange.load_markets()
+        except Exception as e:
+            print(f"    ⚠️ load_markets failed in prepare_data (continue): {e}")
+
         since = exchange.milliseconds() - (days * 24 * 60 * 60 * 1000)
         data_map = {}
         min_required = 2000
 
+        # ✅ symbols가 None이면 여기서 바로 죽는다 -> 방어
+        if symbols is None:
+            print("    ⚠️ symbols is None -> return empty data_map")
+            return {}
+
         print(f"📥 [VirtualExecutor] Downloading data for {len(symbols)} symbols...")
 
         for sym in symbols:
+            # ✅ 상폐/정지/비활성 마켓 제외 (단, markets가 없으면 필터 스킵)
+            markets = getattr(exchange, "markets", None)
+            if isinstance(markets, dict) and markets:
+                m = markets.get(sym)
+                if isinstance(m, dict):
+                    if m.get('active') is False:
+                        print(f"    ⚠️ Skipping inactive market: {sym}")
+                        continue
+                    info = m.get('info')
+                    if isinstance(info, dict):
+                        status = str(info.get('status', '')).upper()
+                        if status and status not in ('TRADING', '1'):
+                            print(f"    ⚠️ Skipping non-trading market ({status}): {sym}")
+                            continue
+
             all_ohlcv = []
             temp_since = since
 
             try:
                 print(f"  - Fetching {sym}...")  # 진행상황 표시
+
+                max_retries = 3
+
                 while True:
-                    # 1000개씩 끊어서 가져오기
-                    ohlcv = exchange.fetch_ohlcv(sym, '15m', since=temp_since, limit=1000)
+                    try:
+                        # ✅ 요청이 오래 걸리면 timeout으로 튕기게 되고, 아래에서 재시도/스킵됨
+                        ohlcv = exchange.fetch_ohlcv(sym, '15m', since=temp_since, limit=1000)
+                    except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
+                        max_retries -= 1
+                        print(f"    ⚠️ Network/Timeout on {sym}: {e} (retries left={max_retries})")
+                        if max_retries <= 0:
+                            print(f"    ❌ Giving up {sym} due to repeated timeouts.")
+                            all_ohlcv = []
+                            break
+                        time.sleep(1.0)
+                        continue
+                    except Exception as e:
+                        print(f"    ❌ Error fetching {sym}: {e}")
+                        all_ohlcv = []
+                        break
+
                     if not ohlcv:
                         break
 
-                    # [Patch] 중복/정체 방지:
-                    # - 일부 환경에서 동일 타임스탬프가 반복될 수 있으므로,
-                    #   마지막 타임스탬프가 업데이트되지 않으면 루프가 길어질 수 있음
                     last_ts = ohlcv[-1][0]
                     if all_ohlcv and last_ts <= all_ohlcv[-1][0]:
-                        # 더 이상 전진이 안 되면 탈출 (무한루프 방지)
                         break
 
                     all_ohlcv.extend(ohlcv)
                     temp_since = last_ts + 1
 
-                    # 기간 충족했으면 탈출
                     if len(ohlcv) < 1000:
                         break
 
-                    # [수정 1] 페이지 넘길 때 휴식 (0.05 -> 0.2로 늘림)
                     time.sleep(0.2)
 
                 # 데이터프레임 변환 (필수)
@@ -171,19 +258,17 @@ class VirtualExecutor:
                     )
 
                     # [Patch] 타입 정리 (수치 계산 안정성)
-                    # - ccxt는 숫자를 float으로 주지만, 환경/파싱 이슈로 object가 끼는 경우가 있음
                     for c in ['open', 'high', 'low', 'close', 'volume']:
                         df[c] = pd.to_numeric(df[c], errors='coerce')
 
                     # [Patch] timestamp 중복 제거 + 정렬
-                    # - 데이터가 겹치면 전략 지표가 깨지고, resample/rolling도 왜곡됨
                     df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
 
                     # 인덱스 설정
                     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df.set_index('datetime', inplace=True)
 
-                    # [Patch] 인덱스 단조증가 보장 (strategy에서 resample/ffill 안정화)
+                    # [Patch] 인덱스 단조증가 보장
                     if not df.index.is_monotonic_increasing:
                         df = df.sort_index()
 
@@ -199,7 +284,6 @@ class VirtualExecutor:
                 time.sleep(5)  # 에러 나면 5초 쿨타임 (중요)
 
             # [수정 2] ★★★ 종목 바뀔 때 1초 휴식 (이게 제일 중요) ★★★
-            # 이걸 안 넣으면 아까처럼 'Skipping...' 뜨면서 다 막힙니다.
             time.sleep(1.0)
 
         return data_map
@@ -228,7 +312,6 @@ class VirtualExecutor:
         avg_loss = loss_trades['pnl'].mean() if not loss_trades.empty else 0
 
         # [Patch] Profit Factor 계산 안정화:
-        # - 손실 합계가 0이면 inf
         if not win_trades.empty and not loss_trades.empty:
             loss_sum = loss_trades['pnl'].sum()
             win_sum = win_trades['pnl'].sum()
@@ -240,7 +323,6 @@ class VirtualExecutor:
         total_return = 0
         if not df_curve.empty and 'equity' in df_curve.columns:
             df_curve['peak'] = df_curve['equity'].cummax()
-            # [Patch] peak가 0일 수 있는 비정상 케이스 방어
             df_curve['dd'] = np.where(
                 df_curve['peak'] > 0,
                 (df_curve['equity'] - df_curve['peak']) / df_curve['peak'] * 100,
@@ -272,17 +354,14 @@ class VirtualExecutor:
         # --- 심볼별 성과 분석 (핵심 추가) ---
         print("🏆 SYMBOL PERFORMANCE (PnL Ranking)")
         if 'sym' in df.columns and 'pnl' in df.columns:
-            # PnL 합계, 거래 횟수, 승률 계산
             sym_stats = df.groupby('sym').agg({
                 'pnl': 'sum',
-                'type': 'count'  # 거래 횟수
+                'type': 'count'
             }).sort_values(by='pnl', ascending=False)
 
-            # 상위 5개 (효자)
             print("\n[TOP 5 PERFORMERS]")
             print(sym_stats.head(5).to_string())
 
-            # 하위 5개 (역적)
             print("\n[BOTTOM 5 PERFORMERS]")
             print(sym_stats.tail(5).to_string())
         else:
