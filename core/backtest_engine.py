@@ -39,8 +39,9 @@ class BacktestEngine:
     - raw OHLCV는 한 번만 준비/캐시 (self.raw_data_map)
     - trial마다 params가 바뀌면 반드시 지표를 재주입해야 함 (rebuild_indicators)
     """
-    
-    def __init__(self, days=180):
+
+    # ✅ 기본 30일
+    def __init__(self, days=30):
         self.root_dir = root_dir
         self.config_path = os.path.join(root_dir, "config.json")
         self.cfg = self._load_config()
@@ -114,7 +115,7 @@ class BacktestEngine:
             targets = self.executor.get_top_targets()
 
         # ---------------------------------------------------------
-        # [CRITICAL FIX] 다운로드 대상에서 블랙리스트 제거
+        # 다운로드 대상에서 블랙리스트 제거
         # ---------------------------------------------------------
         filtered_targets = []
         for sym in targets:
@@ -141,37 +142,76 @@ class BacktestEngine:
 
     def rebuild_indicators(self):
         """
-        trial마다 반드시 호출해야 하는 핵심 함수
-        - 현재 titan.params 기준으로 모든 심볼 DF에 지표를 재주입하고 self.data_map을 재구성한다.
+        [Fix 핵심]
+        - ema_daily 같은 '옵션 컬럼'이 NaN이어도 심볼이 죽지 않게 한다.
+        - dropna()는 '필수 컬럼 subset' 기준으로만 적용한다.
+        - 워밍업(warmup)은 각 필수 컬럼의 첫 유효시점 중 '가장 늦은 시점'을 사용한다.
         """
-        if not self.raw_data_map:
-            self.prepare_data()
+        self.data_map = {}
 
-        if not self.raw_data_map:
-            logger.error("❌ rebuild_indicators failed: raw_data_map is empty.")
-            self.data_map = {}
-            return {}
+        # 엔진이 최소로 필요로 하는 "필수 지표" (일봉 ema_daily는 제외)
+        required_cols = [
+            "open", "high", "low", "close", "volume",
+            "atr", "vol_ma", "ema_intra", "rsi", "adx", "st_val", "st_dir"
+        ]
 
-        logger.info("⚙️ [Engine] Rebuilding Indicators (Trial-Aware)...")
-        rebuilt = {}
+        temp_map = {}
+        global_warmup = 0
 
-        for sym in sorted(self.raw_data_map.keys()):
-            df_raw = self.raw_data_map[sym]
+        # 1) 심볼별 지표 계산 + 심볼별 warmup 계산
+        for sym, df in self.raw_data_map.items():
             try:
-                processed_df = self.titan.calculate_indicators(sym, df_raw)
+                ind = self.titan.calculate_indicators(sym, df.copy())
 
-                # 지표 계산 결과 정리
-                processed_df.dropna(inplace=True)
+                missing = [c for c in required_cols if c not in ind.columns]
+                if missing:
+                    logger.warning(f"[Indicator] {sym} missing required cols: {missing}")
+                    continue
 
-                if not processed_df.empty:
-                    rebuilt[sym] = processed_df
+                if ind[required_cols].isna().all().all():
+                    logger.warning(f"[Indicator] {sym} required columns all-NaN (pre-slice).")
+                    continue
+
+                col_warmups = []
+                for c in required_cols:
+                    s = ind[c]
+                    first_valid = s.first_valid_index()
+                    if first_valid is None:
+                        col_warmups.append(len(ind))
+                    else:
+                        try:
+                            col_warmups.append(ind.index.get_loc(first_valid))
+                        except Exception:
+                            col_warmups.append(0)
+
+                sym_warmup = int(max(col_warmups)) if col_warmups else 0
+                global_warmup = max(global_warmup, sym_warmup)
+
+                temp_map[sym] = ind
+
             except Exception as e:
-                logger.error(f"❌ Indicator Rebuild Error {sym}: {e}")
+                logger.warning(f"[Indicator] {sym} indicator failed: {e}")
 
-        self.data_map = rebuilt
-        self.symbols = list(self.data_map.keys())
-        logger.info(f"✅ Indicators Ready: {len(self.data_map)} symbols processed.")
-        return self.data_map
+        # 2) 모든 심볼을 동일 warmup 이후로 슬라이스 + required subset 기준 dropna
+        for sym, ind in temp_map.items():
+            try:
+                sliced = ind.iloc[global_warmup:].copy()
+                if len(sliced) == 0:
+                    logger.warning(f"[Indicator] {sym} empty after slice")
+                    continue
+
+                # ✅ dropna는 required subset에만 적용 (ema_daily NaN은 허용)
+                sliced = sliced.dropna(subset=required_cols)
+                if len(sliced) == 0:
+                    logger.warning(f"[Indicator] {sym} all NaN after drop (required subset)")
+                    continue
+
+                self.data_map[sym] = sliced
+
+            except Exception as e:
+                logger.warning(f"[Indicator] {sym} slice failed: {e}")
+
+        logger.info(f"Indicators Ready: {len(self.data_map)} symbols processed.")
 
     def _log_csv(self, dt, sym, side, type_note, price, amt, pnl, balance, reason):
         line = f"{dt},{sym},{side},{type_note},{price},{amt},{pnl:.4f},{balance:.2f},{reason}\n"
@@ -197,10 +237,7 @@ class BacktestEngine:
 
         fixed_symbols = sorted(list(self.data_map.keys()))
 
-        # ---------------------------
-        # [Fix #2] Timeline 동기화 강화:
-        # - 모든 심볼의 "공통 인덱스(intersection)"로 timeline 구성
-        # ---------------------------
+        # Timeline 동기화 (intersection)
         start_times = [self.data_map[sym].index[0] for sym in fixed_symbols if not self.data_map[sym].empty]
         if not start_times:
             logger.error("❌ No valid start times.")
@@ -225,7 +262,7 @@ class BacktestEngine:
 
         timeline = common_timeline
 
-        # [Reset] 계좌 및 상태 초기화
+        # [Reset]
         self.executor.history = []
         self.executor.cash = self.executor.initial_balance
         self.executor.equity = self.executor.initial_balance
@@ -236,10 +273,8 @@ class BacktestEngine:
 
         sim_times = timeline[200:]
 
-        # 🕒 Main Time Loop
         for current_time in sim_times:
-
-            # [Step 1] 현재가 업데이트 및 기존 포지션 관리 (청산 우선)
+            # Step 1: 포지션 관리
             current_prices = {}
             for sym in fixed_symbols:
                 df = self.data_map[sym]
@@ -249,11 +284,10 @@ class BacktestEngine:
                 curr_row = df.loc[current_time]
                 current_prices[sym] = curr_row['close']
 
-                # 보유 중인 포지션 관리
                 if sym in self.executor.positions:
                     self._process_existing_position(sym, curr_row, None)
 
-            # [Step 2] 신규 진입 후보군 탐색
+            # Step 2: 신규 진입 후보
             candidates = []
             for sym in fixed_symbols:
                 if sym in self.executor.positions:
@@ -263,15 +297,9 @@ class BacktestEngine:
                 if current_time not in df.index:
                     continue
 
-                # ---------------------------
-                # [Fix #1] curr_row 오염 제거:
-                # Step2에서 심볼별로 curr_row를 반드시 다시 잡는다
-                # ---------------------------
                 curr_row = df.loc[current_time]
-
                 clean_sym = sym.split(':')[0]
 
-                # 쿨다운 & 블랙리스트 체크
                 if sym in self.cooldowns:
                     if current_time < self.cooldowns[sym]:
                         continue
@@ -281,7 +309,6 @@ class BacktestEngine:
                 if clean_sym in self.titan.blacklist:
                     continue
 
-                # 전략 분석: 과거 250봉을 슬라이딩 윈도우로 사용
                 curr_idx_int = df.index.get_loc(current_time)
                 start_idx = max(0, curr_idx_int - 250)
                 past_data = df.iloc[start_idx: curr_idx_int + 1]
@@ -289,27 +316,26 @@ class BacktestEngine:
                 signal, sl_price, tp_price = self.titan.analyze(sym, past_data)
 
                 if signal:
-                    # [핵심] 우선순위 점수: "그 심볼의 그 시점 row"에서만 뽑는다
                     score = float(curr_row.get('adx', 0))
                     candidates.append({
                         'score': score, 'sym': sym, 'signal': signal,
                         'sl': sl_price, 'tp': tp_price, 'row': curr_row
                     })
 
-            # [Step 3] 우선순위 정렬 (Ranking)
+            # Step 3: 정렬
             candidates.sort(key=lambda x: x['score'], reverse=True)
 
-            # [Step 4] 순차 진입 (Execution)
+            # Step 4: 진입
             for cand in candidates:
                 if len(self.executor.positions) >= self.executor.MAX_POSITIONS:
                     break
                 self._process_entry(cand['sym'], cand['signal'], cand['sl'], cand['tp'], cand['row'])
 
-            # Equity Curve 업데이트 (MTM)
+            # MTM
             self.executor.update_equity(current_prices)
             self.executor.equity_curve.append({'dt': current_time, 'equity': self.executor.equity})
 
-        # MTM Equity Curve Save (for dashboard)
+        # Equity curve save
         try:
             if getattr(self.executor, "equity_curve", None):
                 df_curve = pd.DataFrame(self.executor.equity_curve).copy()
@@ -325,7 +351,6 @@ class BacktestEngine:
         except Exception as e:
             logger.error(f"❌ Failed to save equity curve CSV: {e}")
 
-        # 리포트 출력(원하면)
         if show_report:
             try:
                 self.executor.report()
@@ -407,10 +432,7 @@ class BacktestEngine:
 
     def _execute_exit(self, sym, pos, price, reason, dt):
         amount = pos['amount']
-        if pos['side'] == 'LONG':
-            pnl = (price - pos['entry_price']) * amount
-        else:
-            pnl = (pos['entry_price'] - price) * amount
+        pnl = (price - pos['entry_price']) * amount if pos['side'] == 'LONG' else (pos['entry_price'] - price) * amount
 
         exit_value = price * amount
         fee = exit_value * BASE_FEE
@@ -444,9 +466,8 @@ class BacktestEngine:
 
 
 if __name__ == "__main__":
-    engine = BacktestEngine(days=90)
-
-    # 단독 실행 시에는 리포트 출력이 기본적으로 필요함
+    # ✅ 단독 실행도 30일 기본
+    engine = BacktestEngine(days=30)
     engine.prepare_data()
     engine.rebuild_indicators()
     engine.run(show_report=True)

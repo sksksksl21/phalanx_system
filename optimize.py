@@ -3,74 +3,39 @@ import pandas as pd
 import numpy as np
 import os
 import time
-import ccxt
-import json
 import pickle
+import traceback
 from core.backtest_engine import BacktestEngine
-import logging
+
+# ✅ Universe 단일화
+from utils.universe import get_universe, save_universe_snapshot
 
 # 1. Optuna 로그 레벨 조정
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# 2. 파일명 및 경로 설정 (절대 경로로 강제 지정)
+# 2. 파일명 및 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULT_FILE = os.path.join(CURRENT_DIR, "optimization_results.csv")
-DATA_CACHE_FILE = os.path.join(CURRENT_DIR, "market_data_cache.pkl")  # [CHANGED] raw_data_map 캐시
 
-# ==============================================================================
-# [Helper] 바이낸스 선물 거래량 상위 종목 긁어오기
-# ==============================================================================
-def fetch_target_symbols(limit=30):
-    print(f"\n🔍 [Market Scan] 바이낸스 선물 거래량 상위 {limit}개 종목 스캔 중...")
+# ✅ 30일 운영 최적화 전용 캐시로 분리 (180d 캐시 오염 방지)
+DATA_CACHE_FILE = os.path.join(CURRENT_DIR, "market_data_cache_30d.pkl")
 
-    blacklist = set()
-    try:
-        config_path = os.path.join(CURRENT_DIR, "config.json")
-        with open(config_path, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)
-            blacklist_list = cfg.get('strategy_settings', {}).get('blacklist', [])
-            blacklist = set(blacklist_list)
-    except Exception as e:
-        print(f"⚠️ Config 로드 실패: {e}")
+UNIVERSE_SNAPSHOT_FILE = os.path.join(CURRENT_DIR, "universe_optimization.json")
 
-    print(f"🚫 [Config] Blacklist Loaded ({len(blacklist)}): {blacklist}")
-
-    try:
-        binance = ccxt.binance({'options': {'defaultType': 'future'}})
-        tickers = binance.fetch_tickers()
-
-        valid_tickers = []
-        for symbol, data in tickers.items():
-            if '/USDT' in symbol and data.get('quoteVolume'):
-                valid_tickers.append((symbol, float(data['quoteVolume'])))
-
-        sorted_tickers = sorted(valid_tickers, key=lambda x: x[1], reverse=True)
-
-        final_symbols = []
-        for sym, vol in sorted_tickers:
-            clean_sym = sym.split(':')[0]
-            if clean_sym not in blacklist and sym not in blacklist:
-                final_symbols.append(sym)
-                if len(final_symbols) >= limit:
-                    break
-
-        print(f"📊 Top Target Symbols ({len(final_symbols)}): {final_symbols}")
-        return final_symbols
-
-    except Exception as e:
-        print(f"❌ [Scan Error] 종목 스캔 실패: {e}")
-        return ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'BNB/USDT']
 
 # ==============================================================================
 # [Core] 결과 계산
 # ==============================================================================
-def calculate_metrics(initial_balance, history):
+def calculate_metrics(initial_balance: float, history):
     if not history:
         return None
 
     df = pd.DataFrame(history)
-    wins = df[df['pnl'] > 0]
-    losses = df[df['pnl'] <= 0]
+    if df.empty or "pnl" not in df.columns:
+        return None
+
+    wins = df[df["pnl"] > 0]
+    losses = df[df["pnl"] <= 0]
 
     cnt_win = len(wins)
     cnt_loss = len(losses)
@@ -78,74 +43,96 @@ def calculate_metrics(initial_balance, history):
     if total_trades == 0:
         return None
 
-    total_pnl = df['pnl'].sum()
-    final_equity = initial_balance + total_pnl
-    return_pct = (final_equity - initial_balance) / initial_balance * 100
+    total_pnl = float(df["pnl"].sum())
+    final_equity = float(initial_balance + total_pnl)
+    return_pct = (final_equity - initial_balance) / initial_balance * 100.0
 
-    avg_win = wins['pnl'].mean() if cnt_win > 0 else 0
-    avg_loss = losses['pnl'].mean() if cnt_loss > 0 else 0
-    win_rate = (cnt_win / total_trades) * 100
+    avg_win = float(wins["pnl"].mean()) if cnt_win > 0 else 0.0
+    avg_loss = float(losses["pnl"].mean()) if cnt_loss > 0 else 0.0
+    win_rate = (cnt_win / total_trades) * 100.0
 
-    df['cumulative_pnl'] = df['pnl'].cumsum()
-    df['equity_curve'] = initial_balance + df['cumulative_pnl']
-    peak = df['equity_curve'].cummax()
-    drawdown = (df['equity_curve'] - peak) / peak * 100
-    mdd = drawdown.min()
+    df["cumulative_pnl"] = df["pnl"].cumsum()
+    df["equity_curve"] = float(initial_balance) + df["cumulative_pnl"]
+    peak = df["equity_curve"].cummax()
+    drawdown = (df["equity_curve"] - peak) / peak * 100.0
+    mdd = float(drawdown.min()) if len(drawdown) > 0 else 0.0
+
+    gross_profit = float(wins["pnl"].sum()) if cnt_win > 0 else 0.0
+    gross_loss = float(abs(losses["pnl"].sum())) if cnt_loss > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
 
     return {
         "Final Equity": final_equity,
-        "Total Return": return_pct,
-        "MDD": mdd,
-        "Profit Factor": (wins['pnl'].sum() / abs(losses['pnl'].sum())) if len(losses) > 0 and losses['pnl'].sum() != 0 else 0,
-        "Win Rate": win_rate,
-        "Win Count": cnt_win,
-        "Loss Count": cnt_loss,
-        "Avg Win": avg_win,
-        "Avg Loss": avg_loss,
-        "Total Trades": total_trades,
+        "Total Return": float(return_pct),
+        "MDD": float(mdd),
+        "Profit Factor": float(profit_factor),
+        "Win Rate": float(win_rate),
+        "Win Count": int(cnt_win),
+        "Loss Count": int(cnt_loss),
+        "Avg Win": float(avg_win),
+        "Avg Loss": float(avg_loss),
+        "Total Trades": int(total_trades),
     }
+
 
 # ==============================================================================
 # [Objective] 최적화 목표 함수
 # ==============================================================================
 def objective(trial, engine: BacktestEngine):
     params = {
-        'atr_period': trial.suggest_int('atr_period', 10, 30),
-        'atr_multiplier': trial.suggest_float('atr_multiplier', 2.0, 6.0, step=0.5),
-        'adx_threshold': trial.suggest_int('adx_threshold', 15, 35),
-        'rsi_upper': trial.suggest_int('rsi_upper', 60, 80),
-        'rsi_lower': trial.suggest_int('rsi_lower', 20, 40),
-        'vol_factor': trial.suggest_float('vol_factor', 0.8, 2.0, step=0.1),
-        'ema_intraday': 200,
-        'daily_ema': trial.suggest_int('daily_ema', 5, 200, step=5),
+        "atr_period": trial.suggest_int("atr_period", 10, 30),
+        "atr_multiplier": trial.suggest_float("atr_multiplier", 2.0, 6.0, step=0.5),
+        "adx_threshold": trial.suggest_int("adx_threshold", 15, 35),
+        "rsi_upper": trial.suggest_int("rsi_upper", 60, 80),
+        "rsi_lower": trial.suggest_int("rsi_lower", 20, 40),
+        "vol_factor": trial.suggest_float("vol_factor", 0.8, 2.0, step=0.1),
+        "ema_intraday": 200,
+        # ✅ 30일 운영 최적화: daily_ema는 반드시 짧게
+        "daily_ema": trial.suggest_int("daily_ema", 5, 20, step=5),
     }
 
     # 1) params 주입
     engine.titan.set_params(params)
 
-    # 2) [CRITICAL] trial마다 지표 재주입 (raw -> indicators)
+    # 2) trial마다 지표 재생성 → 백테스트 실행
     try:
         engine.rebuild_indicators()
         engine.run(show_report=False)
     except Exception:
+        # 디버그에 도움되게(옵션): 필요하면 출력
+        # print(traceback.format_exc())
         return -99999
 
-    metrics = calculate_metrics(10000, engine.executor.history)
+    initial_balance = getattr(engine.executor, "initial_balance", 10000.0)
+    history = getattr(engine.executor, "history", [])
+    metrics = calculate_metrics(initial_balance, history)
 
     if metrics:
         record = {**params, **metrics}
-        record['trial_id'] = trial.number
+        record["trial_id"] = trial.number
         df_record = pd.DataFrame([record])
 
         if not os.path.exists(RESULT_FILE):
-            df_record.to_csv(RESULT_FILE, index=False, mode='w', encoding='utf-8-sig')
+            df_record.to_csv(RESULT_FILE, index=False, mode="w", encoding="utf-8-sig")
         else:
-            df_record.to_csv(RESULT_FILE, index=False, mode='a', header=False, encoding='utf-8-sig')
+            df_record.to_csv(
+                RESULT_FILE,
+                index=False,
+                mode="a",
+                header=False,
+                encoding="utf-8-sig",
+            )
 
-        return metrics['Final Equity']
+        # Final Equity 최대화
+        return metrics["Final Equity"]
     else:
-        return 10000
+        # 거래가 없거나 계산 불가 → 원금 반환(패널티 성격)
+        return float(initial_balance)
 
+
+# ==============================================================================
+# [Main]
+# ==============================================================================
 if __name__ == "__main__":
     # 결과 파일 초기화
     if os.path.exists(RESULT_FILE):
@@ -158,55 +145,96 @@ if __name__ == "__main__":
     print(f"📂 작업 경로: {CURRENT_DIR}")
     print(f"📂 RAW 캐시 저장 예정 경로: {DATA_CACHE_FILE}")
 
-    # 1. 엔진 생성
-    engine = BacktestEngine(days=180)
+    # 1) 엔진 생성 (✅ 30일 기준)
+    engine = BacktestEngine(days=30)
 
-    # 2. RAW 데이터 로드 or 다운로드
+    # 2) 캐시 로드(있으면)
+    cached_raw = {}
     if os.path.exists(DATA_CACHE_FILE):
         print(f"✅ 기존 RAW 데이터 캐시 발견: {DATA_CACHE_FILE}")
-        print("   파일을 로드합니다... (다운로드 생략)")
+        print("   파일을 로드합니다...")
         try:
             with open(DATA_CACHE_FILE, "rb") as f:
-                engine.raw_data_map = pickle.load(f)
-                engine.symbols = list(engine.raw_data_map.keys())
-                print(f"   로드 완료: {len(engine.symbols)}개 종목 (RAW)")
+                cached_raw = pickle.load(f) or {}
+            print(f"   캐시 로드 완료: {len(cached_raw)}개 종목 (RAW)")
         except Exception as e:
-            print(f"❌ 캐시 로드 실패 (파일 깨짐 등): {e}")
-            print("   새로 다운로드를 시작합니다...")
-            if os.path.exists(DATA_CACHE_FILE):
-                os.remove(DATA_CACHE_FILE)
-            engine.raw_data_map = {}
+            print(f"❌ 캐시 로드 실패: {e}")
+            cached_raw = {}
 
-    if not engine.raw_data_map:
-        print("⏳ 데이터 다운로드 시작...")
-        target_symbols = fetch_target_symbols(limit=30)
+    # 3) ✅ Universe 선정: 14개(코어8 + 위성6)
+    print(f"🚫 [System] Configured Blacklist: {engine.titan.blacklist}")
 
-        engine.symbols = target_symbols
-        engine.prepare_data()  # RAW 다운로드 실행
+    universe_symbols = get_universe(
+        executor=engine.executor,
+        top_n=14,
+        # ✅ 30일 운영형 최소 데이터 확보 (30일*96=2880 → 여유 포함 3000)
+        validate_ohlcv=True,
+        timeframe="15m",
+        min_ohlcv_rows=3000,
+        # ✅ 너무 촘촘하게 잡히면 위성이 부족할 수 있으니 기본은 50M 유지 (필요하면 20M으로 낮춰)
+        min_quote_volume=50_000_000.0,
+    )
 
-        raw_count = len(engine.raw_data_map)
-        print(f"📊 메모리에 로드된 RAW 데이터: {raw_count}개 종목")
+    print(f"🧭 [Universe] Selected ({len(universe_symbols)}): {universe_symbols}")
 
-        if raw_count > 0:
-            print(f"💾 RAW 데이터 저장 시도 중... -> {DATA_CACHE_FILE}")
-            try:
-                with open(DATA_CACHE_FILE, "wb") as f:
-                    pickle.dump(engine.raw_data_map, f)
-                print(f"✅ RAW 데이터 저장 성공! (용량: {os.path.getsize(DATA_CACHE_FILE) / 1024 / 1024:.2f} MB)")
-            except Exception as e:
-                print(f"❌ RAW 데이터 저장 실패: {e}")
+    # 스냅샷 저장(Optimize → Backtest 동일 Universe 재현용)
+    try:
+        save_universe_snapshot(
+            UNIVERSE_SNAPSHOT_FILE,
+            universe_symbols,
+            meta={
+                "policy": "core8+sat6",
+                "days": engine.test_days,
+                "ts": int(time.time()),
+            },
+        )
+        print(f"✅ Universe Snapshot 저장 완료: {UNIVERSE_SNAPSHOT_FILE}")
+    except Exception as e:
+        print(f"⚠️ Universe Snapshot 저장 실패: {e}")
+
+    # 4) 캐시 merge + 부족분 다운로드
+    engine.symbols = universe_symbols
+    engine.raw_data_map = {}
+
+    missing = []
+    for sym in universe_symbols:
+        if sym in cached_raw:
+            engine.raw_data_map[sym] = cached_raw[sym]
         else:
-            print("⚠️ 경고: 다운로드된 데이터가 없습니다. (저장할 내용 없음)")
+            missing.append(sym)
 
-    print(f"✅ 최적화 루프 시작 (Total Symbols: {len(engine.symbols)})")
+    if missing:
+        print(f"⏳ 캐시에 없는 심볼 {len(missing)}개 추가 다운로드 시작...")
+        try:
+            new_map = engine.executor.prepare_data(missing)  # VirtualExecutor.prepare_data(list)
+            if new_map:
+                engine.raw_data_map.update(new_map)
+        except Exception as e:
+            print(f"❌ 추가 다운로드 실패: {e}")
+
+    print(
+        f"📊 최종 RAW 데이터: {len(engine.raw_data_map)}개 종목 (Universe 목표: {len(universe_symbols)}개)"
+    )
+
+    # 5) 캐시 저장(갱신)
+    if len(engine.raw_data_map) > 0:
+        try:
+            with open(DATA_CACHE_FILE, "wb") as f:
+                pickle.dump(engine.raw_data_map, f)
+            print(f"✅ RAW 데이터 캐시 저장 완료: {DATA_CACHE_FILE}")
+        except Exception as e:
+            print(f"❌ RAW 데이터 저장 실패: {e}")
+
+    # 6) 최적화 시작
+    print(f"✅ 최적화 루프 시작 (Universe Symbols: {len(universe_symbols)})")
     print(f"📄 결과 저장 경로: {RESULT_FILE}\n")
 
-    study = optuna.create_study(direction='maximize')
+    study = optuna.create_study(direction="maximize")
     study.optimize(lambda trial: objective(trial, engine), n_trials=2000, n_jobs=1)
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print(f"🎉 Optimization Finished! (Total Trials: {len(study.trials)})")
-    print("="*50)
+    print("=" * 50)
     try:
         print(f"🏆 Best Equity : ${study.best_value:,.2f}")
         print("-" * 50)
@@ -215,4 +243,4 @@ if __name__ == "__main__":
             print(f"   - {key:<15}: {value}")
     except:
         print("⚠️ 유효한 결과가 없습니다.")
-    print("="*50)
+    print("=" * 50)
