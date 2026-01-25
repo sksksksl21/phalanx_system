@@ -1,4 +1,36 @@
 {
-    "positions": {},
-    "updated": 1768579228.0969596
+  "positions": {
+    "HYPE/USDT:USDT": {
+      "side": "SHORT",
+      "amount": 79.6,
+      "entry_price": 22.424,
+      "sl": 22.780663714456736,
+      "tp1": 22.119714573672965,
+      "tp1_hit": false,
+      "entry_time": "2026-01-25 08:45:00",
+      "margin": 594.9834666666667
+    },
+    "ETH/USDT:USDT": {
+      "side": "SHORT",
+      "amount": 0.573,
+      "entry_price": 2927.05,
+      "sl": 2948.0091348200817,
+      "tp1": 2913.400372950119,
+      "next_sl": null,
+      "tp1_hit": false,
+      "entry_time": "2026-01-25 08:45:00",
+      "margin": 559.06655
+    }
+  },
+  "cooldowns": {
+    "FOGO/USDT:USDT": "2026-01-25 16:30:22.342006+00:00"
+  },
+  "consecutive_losses": {
+    "FOGO/USDT:USDT": 1
+  },
+  "last_processed_time": "2026-01-25 12:00:00",
+  "last_bucket": 1965937,
+  "paper_cash": 8770.532440703986,
+  "paper_equity": 9906.119237370653,
+  "paper_equity0": 10000.0
 }
