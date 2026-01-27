@@ -1,3 +1,5 @@
+# core/backtest_engine_B.py
+
 import sys
 import os
 import json
@@ -24,7 +26,8 @@ logger = logging.getLogger("PhalanxBacktest")
 
 try:
     from strategy.titan_strategy import TitanStrategy
-    from execution.virtual_executor import VirtualExecutor
+    # ✅ B는 VirtualExecutorB를 써야 1m exit 계약이 성립한다.
+    from execution.virtual_executor_B import VirtualExecutorB
 except ImportError as e:
     logger.critical(f"❌ Module Import Error: {e}")
     sys.exit(1)
@@ -32,12 +35,9 @@ except ImportError as e:
 
 class BacktestEngine:
     """
-    [Phalanx Core Module] Backtest Orchestrator
-    Mode: Time-Sequential & Priority-Based (Deterministic)
-
-    [IMPORTANT FOR OPTIMIZATION]
-    - raw OHLCV는 한 번만 준비/캐시 (self.raw_data_map)
-    - trial마다 params가 바뀌면 반드시 지표를 재주입해야 함 (rebuild_indicators)
+    [Phalanx Core Module] Backtest Orchestrator (B)
+    - 15m entry
+    - 1m exit-only touch check (SL/TP)
     """
 
     def __init__(self, days=30):
@@ -54,13 +54,14 @@ class BacktestEngine:
 
         # 1. 전략 및 실행기 초기화
         self.titan = TitanStrategy()
-        self.executor = VirtualExecutor()
+        self.executor = VirtualExecutorB()
 
         # [Safety] 초기 자본금 강제 주입
         if not hasattr(self.executor, 'initial_balance'):
             self.executor.initial_balance = 10000.0
-            self.executor.cash = 10000.0
-            self.executor.equity = 10000.0
+        # 초기 상태도 강제 정합
+        self.executor.cash = float(getattr(self.executor, "cash", self.executor.initial_balance))
+        self.executor.equity = float(getattr(self.executor, "equity", self.executor.initial_balance))
 
         self.risk_ctrl = RiskControl(self.executor, self.cfg)
         self.monitor = PositionMonitor()
@@ -84,6 +85,12 @@ class BacktestEngine:
 
         # MTM Equity Curve CSV 경로 (대시보드용)
         self.equity_curve_file = os.path.join(root_dir, "backtest_equity_curve.csv")
+
+        # (B) required cols
+        self.required_cols = [
+            "open", "high", "low", "close", "volume",
+            "atr", "vol_ma", "ema_intra", "rsi", "adx", "st_val", "st_dir"
+        ]
 
     def _load_config(self):
         if not os.path.exists(self.config_path):
@@ -120,7 +127,7 @@ class BacktestEngine:
     def prepare_data(self, symbols=None):
         """
         - raw_data_map이 이미 있으면 재다운로드하지 않는다.
-        - 다만, 지표(data_map)는 trial마다 바뀔 수 있으므로 rebuild_indicators()로 재생성한다.
+        - B: 15m raw 로딩 후, 1m 데이터도 (exit-only) 준비한다.
         """
         if self.raw_data_map and len(self.raw_data_map) > 0:
             return self.raw_data_map
@@ -145,7 +152,7 @@ class BacktestEngine:
 
         targets = filtered_targets
 
-        raw_data_map = self.executor.prepare_data(targets)
+        raw_data_map = self.executor.prepare_data(targets, days=self.test_days)
 
         if not raw_data_map:
             logger.error("❌ No Data Loaded.")
@@ -156,6 +163,15 @@ class BacktestEngine:
 
         logger.info(f"✅ Raw Data Ready: {len(self.raw_data_map)} symbols loaded.")
         self.symbols = list(self.raw_data_map.keys())
+
+        # ✅ (B 핵심) 1m 데이터 준비 (EXIT ONLY)
+        try:
+            logger.info("📥 [Data Loader] Fetching 1m Data (Exit Only)...")
+            self.executor.prepare_data_1m(self.symbols, days=self.test_days)
+        except Exception as e:
+            # 1m이 일부 실패해도 15m 시뮬은 진행 가능 (해당 심볼은 1m exit 미적용)
+            logger.error(f"❌ Failed to prepare 1m data (continue): {e}")
+
         return self.raw_data_map
 
     def rebuild_indicators(self):
@@ -165,11 +181,6 @@ class BacktestEngine:
         - 심볼별 warmup으로 슬라이스
         """
         self.data_map = {}
-
-        self.required_cols = [
-            "open", "high", "low", "close", "volume",
-            "atr", "vol_ma", "ema_intra", "rsi", "adx", "st_val", "st_dir"
-        ]
 
         temp_map = {}
         warmup_map = {}
@@ -295,10 +306,7 @@ class BacktestEngine:
             logger.error("❌ Candidate timeline too short.")
             return
 
-        # ✅ (2) 핵심 수정:
-        # - max_start로 "미리 자르지 않는다"
-        # - candidate 전체 구간에 대해 먼저 reindex/ffill 해서 seed 확보
-        # - 그 다음에 >= max_start 로 자른다 (lookahead 없음, bfill 없음)
+        # candidate 전체 구간 reindex/ffill 후 max_start부터 사용
         aligned_full_map = {}
         usable_syms = []
         for sym in fixed_symbols:
@@ -307,13 +315,10 @@ class BacktestEngine:
                 continue
 
             aligned_full = df.reindex(candidate_timeline_full).ffill()
-
-            # max_start 이후부터만 실제 시뮬에 사용
             aligned_full = aligned_full.loc[aligned_full.index >= max_start].copy()
             if aligned_full.empty:
                 continue
 
-            # 첫 줄이 required_cols 기준으로 NaN이면(=ffill seed 자체가 없는 케이스) 드랍
             if aligned_full[self.required_cols].iloc[0].isna().any():
                 logger.warning(f"[Align] {sym} still NaN at aligned start after ffill. Drop symbol.")
                 continue
@@ -325,7 +330,6 @@ class BacktestEngine:
             logger.error("❌ Alignment failed: no usable symbols after reindex/ffill.")
             return
 
-        # 마지막으로 “완전 공통” index로 맞춤 (포지션 관리/MTM 누락 제거)
         common_idx = None
         for sym, df in aligned_full_map.items():
             common_idx = df.index if common_idx is None else common_idx.intersection(df.index)
@@ -366,6 +370,9 @@ class BacktestEngine:
             logger.error(f"❌ Not enough simulation steps after warmup: {len(sim_times)}")
             return
 
+        # ✅ (B 핵심) 1m EXIT 중복스캔 방지용: 포지션별 마지막 체크 구간 관리
+        # - entry_time부터 매번 current_time까지 스캔하면, 1) 느려지고 2) 겹친 구간 재스캔으로 이상해질 수 있음
+        # - 그래서 pos['last_1m_check']를 둔다.
         for current_time in sim_times:
             current_rows = {}
             current_prices = {}
@@ -374,10 +381,55 @@ class BacktestEngine:
                 current_rows[sym] = row
                 current_prices[sym] = float(row["close"])
 
-            # ✅ (3) sizing 기준 통일: 먼저 equity 업데이트
+            # sizing 기준 통일: 먼저 equity 업데이트
             self.executor.update_equity(current_prices)
 
-            # Step 1: 포지션 관리
+            # =====================================================
+            # (B) Step 0: 1m EXIT 우선 적용 (SL/TP 터치)
+            # =====================================================
+            # positions dict를 직접 도는 중에 삭제되므로 list()로 복사해서 순회
+            for sym in list(self.executor.positions.keys()):
+                pos = self.executor.positions.get(sym)
+                if not pos:
+                    continue
+
+                # 1m 데이터가 없는 심볼은 패스 (이 심볼은 15m 관리만)
+                if not hasattr(self.executor, "check_exit_1m"):
+                    break
+
+                start_dt = pos.get("last_1m_check", pos.get("entry_time", None))
+                if start_dt is None:
+                    start_dt = current_time - self.bar_td  # fallback
+
+                end_dt = current_time
+
+                try:
+                    hit = self.executor.check_exit_1m(sym, start_dt, end_dt)
+                except Exception:
+                    hit = None
+
+                if hit:
+                    # hit 계약: ("EXIT", ts, price, reason)
+                    try:
+                        _, ts, price, reason = hit
+                    except Exception:
+                        # 계약 깨진 경우는 그냥 무시 (터지지 않게)
+                        continue
+
+                    # 내부 _execute_exit로 처리해야 cooldown/log가 A와 동일하게 적용됨
+                    pos_now = self.executor.positions.get(sym)
+                    if pos_now:
+                        self._execute_exit(sym, pos_now, float(price), str(reason), ts)
+
+                    # 다음 심볼로
+                    continue
+
+                # 이번 구간까지 체크 완료 표시(중복 스캔 방지)
+                pos2 = self.executor.positions.get(sym)
+                if pos2:
+                    pos2["last_1m_check"] = end_dt
+
+            # Step 1: 포지션 관리 (15m PositionMonitor)
             for sym in fixed_symbols:
                 if sym not in self.executor.positions:
                     continue
@@ -468,7 +520,7 @@ class BacktestEngine:
 
         entry_price = curr_row['close'] + slippage if signal == 'LONG' else curr_row['close'] - slippage
 
-        # ✅ (3) sizing 기준: cash → equity 로 통일
+        # sizing 기준: cash → equity 로 통일
         current_equity = float(getattr(self.executor, "equity", self.executor.cash))
 
         amount = self.risk_ctrl.calculate_entry_size(sym, entry_price, current_equity, sl, signal)
@@ -491,11 +543,17 @@ class BacktestEngine:
                     'tp1': tp,
                     'next_sl': None,
                     'tp1_hit': False,
-                    'entry_time': curr_row.name
+                    'entry_time': curr_row.name,
+                    # ✅ (B) 1m exit 체크 시작점
+                    'last_1m_check': curr_row.name
                 }
                 self._log_csv(curr_row.name, sym, signal, 'ENTRY', entry_price, amount, 0, self.executor.equity, 'Signal Entry')
 
     def _process_existing_position(self, sym, curr_row, new_signal):
+        # 15m 모니터링(기존대로)
+        if sym not in self.executor.positions:
+            return
+
         pos = self.executor.positions[sym]
         market_data = {
             'close': curr_row['close'],
@@ -544,6 +602,10 @@ class BacktestEngine:
             self._execute_exit(sym, pos, flip_price, 'SIGNAL_FLIP', curr_row.name)
 
     def _execute_exit(self, sym, pos, price, reason, dt):
+        # 포지션이 이미 지워졌을 수도 있음(1m exit 이후 15m 루프에서 다시 들어올 수 있으니 방어)
+        if sym not in self.executor.positions:
+            return
+
         amount = pos['amount']
         pnl = (price - pos['entry_price']) * amount if pos['side'] == 'LONG' else (pos['entry_price'] - price) * amount
 
@@ -555,7 +617,7 @@ class BacktestEngine:
 
         net_pnl = pnl - fee
 
-        # ✅ (1) 동일 캔들 재진입 금지: 최소 1캔들 쿨다운
+        # 동일 캔들 재진입 금지: 최소 1캔들 쿨다운
         min_next = dt + self.bar_td
 
         if net_pnl > 0:
@@ -577,8 +639,19 @@ class BacktestEngine:
             cd = dt + pd.Timedelta(hours=wait_hours)
             self.cooldowns[sym] = max(cd, min_next)
 
+        # equity는 루프에서 MTM으로 갱신되지만, 로그 시점 일관성 위해 최소 반영
+        try:
+            self.executor.equity = float(self.executor.cash)
+        except Exception:
+            pass
+
         self._log_csv(dt, sym, pos['side'], 'EXIT', price, amount, net_pnl, self.executor.equity, reason)
-        del self.executor.positions[sym]
+
+        try:
+            del self.executor.positions[sym]
+        except Exception:
+            pass
+
         self.executor.history.append({'dt': dt, 'sym': sym, 'type': 'EXIT', 'pnl': net_pnl, 'reason': reason})
 
 

@@ -31,7 +31,6 @@ import math
 import logging
 import pandas as pd
 
-# 경로 설정
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 sys.path.append(root_dir)
@@ -50,9 +49,11 @@ logger = logging.getLogger("PhalanxLive")
 
 class DryRunTrack:
     """
-    DRY_RUN 전용 트랙 상태/회계/기록/연속성.
-    - state/history를 트랙별로 완전 분리
-    - positions/paper/cooldown도 트랙별로 완전 분리
+    DRY_RUN Track (paper trading)
+    - trade_history_{track_id}.csv append
+    - phalanx_state_{track_id}.json save/restore
+    - cooldown / consecutive_losses
+    - DEBUG: 실제 바인딩된 메서드 라인 출력
     """
 
     def __init__(self, track_id: str, entry_tf: str, manage_tf: str, cfg: dict, executor: BinanceExecutor):
@@ -60,76 +61,85 @@ class DryRunTrack:
         self.entry_tf = str(entry_tf)
         self.manage_tf = str(manage_tf)
 
-        self.cfg = cfg
-        self.executor = executor  # precision helpers / exchange access only (주문 X)
+        self.cfg = cfg or {}
+        self.executor = executor
 
-        # files (track separated)
         self.state_path = os.path.join(root_dir, f"phalanx_state_{self.track_id}.json")
         self.history_path = os.path.join(root_dir, f"trade_history_{self.track_id}.csv")
 
-        # paper
-        self.paper_equity0 = float(cfg.get("system_settings", {}).get("paper_equity", 10000.0))
+        self.paper_equity0 = float(self.cfg.get("system_settings", {}).get("paper_equity", 10000.0))
         self.paper_cash = float(self.paper_equity0)
         self.paper_equity = float(self.paper_equity0)
 
-        # positions / guards
-        self.positions = {}
-        self.cooldowns = {}
-        self.consecutive_losses = {}
+        self.positions = {}             # {sym: {side, amount, entry_price, sl, tp1, ...}}
+        self.cooldowns = {}             # {sym: timestamp}
+        self.consecutive_losses = {}    # {sym: int}
 
-        # per-track runtime guards
-        self.last_entry_bucket = None     # 15m bucket processed for ENTRY/A-manage
-        self.last_manage_bucket = None    # manage_tf bucket processed for manage loop
+        self.last_entry_bucket = None
+        self.last_manage_bucket = None
         self.last_processed_entry_time = None
         self.last_processed_manage_time = None
 
-        # history ensure
+        # 1) history/state 준비
         self._ensure_history_file()
-
-        # load state
         self._load_state()
-
-        # restore paper if state empty/initial
         self._restore_paper_from_history_if_needed()
 
-        # BOOT record
+        # 2) BOOT 로그 + 바인딩 디버그
+        boot_time = pd.Timestamp.utcnow()
         self._append_history({
-            "dt": str(pd.Timestamp.utcnow()),
+            "dt": str(boot_time),
             "event": "BOOT",
             "mode": "DRY_RUN",
             "symbol": "",
             "side": "",
             "reason": f"engine_start track={self.track_id} entry={self.entry_tf} manage={self.manage_tf}",
-            "pos_count": int(len(self.positions or {})),
+            "pos_count": int(len(self.positions)),
             "cash": float(self.paper_cash),
             "equity": float(self.paper_equity),
         })
 
-        # touch state
+        self._debug_method_binding()
+
+        # 3) 저장
         self._save_state()
 
     # -------------------------
-    # History
+    # Debug: which method version is actually bound
+    # -------------------------
+    def _debug_method_binding(self):
+        try:
+            import inspect
+
+            def loc(fn):
+                try:
+                    file = inspect.getsourcefile(fn) or "?"
+                    line = fn.__code__.co_firstlineno
+                    return f"{os.path.basename(file)}:{line}"
+                except Exception:
+                    return "?:?"
+
+            logger.info(
+                f"🧩 DRYRUN_BINDING | track={self.track_id} "
+                f"open_position@{loc(self.open_position)} "
+                f"handle_exit@{loc(self.handle_exit)} "
+                f"_save_state@{loc(self._save_state)} "
+                f"_load_state@{loc(self._load_state)} "
+                f"_append_history@{loc(self._append_history)}"
+            )
+        except Exception as e:
+            logger.warning(f"[Track {self.track_id}] binding debug failed: {e}")
+
+    # -------------------------
+    # History helpers
     # -------------------------
     def _history_columns(self):
         return [
-            "dt",
-            "event",
-            "mode",
-            "symbol",
-            "side",
-            "price",
-            "amount",
-            "fee",
-            "margin",
-            "pnl",
-            "roe_pct",
-            "sl",
-            "tp1",
-            "reason",
-            "pos_count",
-            "cash",
-            "equity",
+            "dt", "event", "mode", "symbol", "side",
+            "price", "amount", "fee", "margin",
+            "pnl", "roe_pct",
+            "sl", "tp1",
+            "reason", "pos_count", "cash", "equity",
         ]
 
     def _ensure_history_file(self):
@@ -151,7 +161,8 @@ class DryRunTrack:
 
     def _restore_paper_from_history_if_needed(self):
         """
-        state paper가 기본값 수준이면 history 마지막 cash/equity로 복구
+        state의 paper_cash/equity가 '초기값 수준'이면
+        history 마지막 cash/equity로 복구.
         """
         try:
             if not os.path.exists(self.history_path) or os.path.getsize(self.history_path) == 0:
@@ -161,25 +172,29 @@ class DryRunTrack:
             if df.empty:
                 return
 
-            df = df[df.get("mode", "") == "DRY_RUN"]
-            if df.empty:
+            # DRY_RUN만
+            if "mode" in df.columns:
+                df = df[df["mode"] == "DRY_RUN"]
+                if df.empty:
+                    return
+
+            # cash/equity 유효한 마지막
+            if ("cash" not in df.columns) or ("equity" not in df.columns):
                 return
 
-            df = df.dropna(subset=["cash", "equity"], how="all")
-            if df.empty:
+            df2 = df.dropna(subset=["cash", "equity"], how="any")
+            if df2.empty:
                 return
 
-            last = df.iloc[-1]
-            last_cash = last.get("cash", None)
-            last_eq = last.get("equity", None)
+            last = df2.iloc[-1]
+            last_cash = float(last["cash"])
+            last_eq = float(last["equity"])
 
-            if last_cash is not None and not pd.isna(last_cash):
-                if abs(float(self.paper_cash) - float(self.paper_equity0)) < 1e-6:
-                    self.paper_cash = float(last_cash)
-
-            if last_eq is not None and not pd.isna(last_eq):
-                if abs(float(self.paper_equity) - float(self.paper_equity0)) < 1e-6:
-                    self.paper_equity = float(last_eq)
+            # state가 초기값(=paper_equity0)과 같으면 history 값으로 복구
+            if abs(float(self.paper_cash) - float(self.paper_equity0)) < 1e-6:
+                self.paper_cash = float(last_cash)
+            if abs(float(self.paper_equity) - float(self.paper_equity0)) < 1e-6:
+                self.paper_equity = float(last_eq)
 
         except Exception as e:
             logger.error(f"[Track {self.track_id}] Restore paper from history failed: {e}")
@@ -195,18 +210,22 @@ class DryRunTrack:
                 state = json.load(f)
 
             self.positions = state.get("positions", {}) or {}
-            self.cooldowns = state.get("cooldowns", {}) or {}
             self.consecutive_losses = state.get("consecutive_losses", {}) or {}
 
-            for k, v in list(self.cooldowns.items()):
+            # cooldowns는 timestamp string -> Timestamp로 복구
+            cd = state.get("cooldowns", {}) or {}
+            restored = {}
+            for k, v in cd.items():
                 try:
-                    self.cooldowns[k] = pd.to_datetime(v)
+                    restored[k] = pd.to_datetime(v)
                 except Exception:
-                    pass
+                    restored[k] = v
+            self.cooldowns = restored
 
             pc = state.get("paper_cash", None)
             pe = state.get("paper_equity", None)
             p0 = state.get("paper_equity0", None)
+
             if p0 is not None:
                 try:
                     self.paper_equity0 = float(p0)
@@ -261,19 +280,38 @@ class DryRunTrack:
     # Accounting
     # -------------------------
     def mtm_update_equity(self, current_prices: dict):
+        """
+        equity = cash + (모든 포지션의 margin + pnl)
+        current_prices: {sym: last_price}
+        """
         eq = float(self.paper_cash)
+
         for sym, pos in (self.positions or {}).items():
-            px = float(current_prices.get(sym, pos.get("entry_price", 0)) or 0)
-            entry = float(pos.get("entry_price", 0) or 0)
-            amt = float(pos.get("amount", 0) or 0)
-            side = str(pos.get("side", "")).upper()
-            margin = float(pos.get("margin", 0) or 0)
+            try:
+                # ❗ 가격이 없으면 MTM 금지 (shadow smoothing 방지)
+                if sym not in current_prices:
+                    eq += float(pos.get("margin", 0))
+                    continue
 
-            pnl = (px - entry) * amt if side == "LONG" else (entry - px) * amt
-            eq += (margin + pnl)
+                px = float(current_prices[sym])
+                entry = float(pos.get("entry_price", 0))
+                amt = float(pos.get("amount", 0))
+                side = str(pos.get("side", "")).upper()
+                margin = float(pos.get("margin", 0))
 
-        self.paper_equity = float(eq)
-        return self.paper_equity
+                pnl = (px - entry) * amt if side == "LONG" else (entry - px) * amt
+                eq += (margin + pnl)
+
+            except Exception:
+                # 계산 실패 시에도 margin은 보존
+                try:
+                    eq += float(pos.get("margin", 0))
+                except Exception:
+                    pass
+
+        self.paper_equity = eq
+        return eq
+
 
     # -------------------------
     # Cooldown
@@ -294,7 +332,7 @@ class DryRunTrack:
             self.consecutive_losses[sym] = 0
             self.cooldowns[sym] = now
         else:
-            streak = self.consecutive_losses.get(sym, 0) + 1
+            streak = int(self.consecutive_losses.get(sym, 0)) + 1
             self.consecutive_losses[sym] = streak
 
             if streak == 1:
@@ -313,13 +351,6 @@ class DryRunTrack:
             f"until={self.cooldowns.get(sym)}"
         )
 
-    # -------------------------
-    # Trade ops (DRY_RUN)
-    # -------------------------
-    def can_open_more(self):
-        max_pos = int(self.cfg.get("risk_settings", {}).get("max_open_positions", 3))
-        return len(self.positions) < max_pos
-
     def is_in_cooldown(self, sym, candle_time):
         cd = self.cooldowns.get(sym)
         if cd is None:
@@ -330,9 +361,16 @@ class DryRunTrack:
         except Exception:
             return False
 
+    # -------------------------
+    # Trade ops (DRY_RUN)
+    # -------------------------
+    def can_open_more(self):
+        max_pos = int(self.cfg.get("risk_settings", {}).get("max_open_positions", 3))
+        return len(self.positions) < max_pos
+
     def open_position(self, sym, signal, fill_px, amount_raw, sl, tp, entry_time):
         """
-        동일 entry 신호/가격/수량이 엔진에서 들어옴(복제).
+        엔진에서 동일 entry 신호/가격/수량이 들어옴(복제).
         트랙은 자기 cash/cooldown/poslimit만 보고 수락/거절.
         """
         # already has
@@ -377,6 +415,7 @@ class DryRunTrack:
             })
             return False
 
+        # qty precision
         try:
             filled_qty = float(self.executor.amount_to_precision(sym, float(amount_raw)))
         except Exception:
@@ -400,7 +439,8 @@ class DryRunTrack:
             })
             return False
 
-        fee = float(fill_px * filled_qty * BASE_FEE)
+        # fee/margin
+        fee = float(fill_px) * float(filled_qty) * BASE_FEE
         leverage = self.cfg.get("risk_settings", {}).get("leverage", 1)
         try:
             leverage = float(leverage)
@@ -412,6 +452,7 @@ class DryRunTrack:
         margin = (float(fill_px) * float(filled_qty)) / float(leverage)
         required = margin + fee
 
+        # cash check
         if float(self.paper_cash) < float(required):
             self._append_history({
                 "dt": str(pd.to_datetime(entry_time)),
@@ -432,10 +473,11 @@ class DryRunTrack:
             })
             return False
 
+        # accept
         self.paper_cash -= float(required)
 
         self.positions[sym] = {
-            "side": signal,
+            "side": str(signal).upper(),
             "amount": float(filled_qty),
             "entry_price": float(fill_px),
             "sl": float(sl) if sl is not None else None,
@@ -456,7 +498,7 @@ class DryRunTrack:
             "event": "ENTRY",
             "mode": "DRY_RUN",
             "symbol": sym,
-            "side": signal,
+            "side": str(signal).upper(),
             "price": float(fill_px),
             "amount": float(filled_qty),
             "fee": float(fee),
@@ -477,21 +519,24 @@ class DryRunTrack:
         pos = self.positions.get(sym)
         if not pos:
             return
-        if "next_sl" in pos and pos["next_sl"] is not None:
+        if pos.get("next_sl", None) is not None:
             try:
                 if float(pos["next_sl"]) != float(pos.get("sl", 0) or 0):
                     pos["sl"] = float(pos["next_sl"])
             except Exception:
                 pass
-            pos.pop("next_sl", None)
+            pos["next_sl"] = None
 
     def handle_update_sl(self, sym, candle_time, close_px, reason, new_sl):
         try:
             pos = self.positions.get(sym, {})
+            if not pos:
+                return
             if new_sl is None:
                 return
             if float(new_sl) == float(pos.get("sl", 0) or 0):
                 return
+
             pos["next_sl"] = float(new_sl)
 
             logger.info(f"🟡 UPDATE_SL | track={self.track_id} {sym} next_sl={pos['next_sl']} reason={reason}")
@@ -513,7 +558,7 @@ class DryRunTrack:
                 "equity": float(self.paper_equity),
             })
         except Exception:
-            pass
+            return
 
     def handle_exit(self, sym, candle_time, exec_px, reason):
         pos = self.positions.get(sym)
@@ -522,12 +567,13 @@ class DryRunTrack:
 
         pnl = None
         fee = None
+        margin = float(pos.get("margin", 0) or 0)
+
         try:
             px = float(exec_px)
             entry = float(pos.get("entry_price", 0))
             amt = float(pos.get("amount", 0))
             side = str(pos.get("side", "")).upper()
-            margin = float(pos.get("margin", 0))
 
             pnl = (px - entry) * amt if side == "LONG" else (entry - px) * amt
             fee = px * amt * BASE_FEE
@@ -538,6 +584,13 @@ class DryRunTrack:
 
         logger.info(f"🟦 DRY_RUN EXIT | track={self.track_id} {sym} px={exec_px} reason={reason} cash={self.paper_cash:.2f}")
 
+        roe = None
+        try:
+            if margin > 0 and pnl is not None:
+                roe = (float(pnl) / float(margin)) * 100.0
+        except Exception:
+            roe = None
+
         self._append_history({
             "dt": str(pd.to_datetime(candle_time)),
             "event": "EXIT",
@@ -547,12 +600,13 @@ class DryRunTrack:
             "price": float(exec_px) if exec_px is not None else None,
             "amount": float(pos.get("amount", 0)),
             "fee": float(fee) if fee is not None else None,
-            "margin": float(pos.get("margin", 0)),
+            "margin": float(margin),
             "pnl": float(pnl) if pnl is not None else None,
+            "roe_pct": float(roe) if roe is not None else None,
             "sl": float(pos.get("sl", 0)) if pos.get("sl") is not None else None,
             "tp1": float(pos.get("tp1", 0)) if pos.get("tp1") is not None else None,
             "reason": f"{reason} track={self.track_id}",
-            "pos_count": int(len(self.positions) - 1),
+            "pos_count": int(max(len(self.positions) - 1, 0)),
             "cash": float(self.paper_cash),
             "equity": float(self.paper_equity),
         })
@@ -572,7 +626,6 @@ class DryRunTrack:
             f"manage_tf={self.manage_tf}"
         )
 
-        # optional to csv (engine-level option only; keep always on for tracks? -> follow cfg)
         log_hb = bool(self.cfg.get("system_settings", {}).get("log_heartbeat_to_csv", False))
         if log_hb:
             self._append_history({
@@ -850,6 +903,8 @@ class LiveEngine:
     # -----------------------------------------------------
     def prepare_data(self):
         targets = self.executor.get_top_targets() or []
+        logger.info(f"📡 MARKET_SCAN | targets={targets[:10]} (top10)")
+
 
         filtered = []
         for sym in targets:
@@ -871,6 +926,8 @@ class LiveEngine:
         for sym, df in raw_map.items():
             v = DataLoader.validate_and_format(df)
             if v is None:
+                logger.warning(f"⚠️ DATA_DROP | {sym} validate failed")
+
                 continue
 
             v = v.copy()
@@ -885,6 +942,8 @@ class LiveEngine:
         self.raw_data_map = {k: validated_map[k] for k in sorted(validated_map.keys())}
         self.rebuild_indicators()
         self.symbols = sorted(self.data_map.keys())
+        logger.info(f"📊 INDICATORS_READY | symbols={self.symbols}")
+
 
         logger.info(f"📥 Data prepared: raw={len(self.raw_data_map)} | ready={len(self.data_map)}")
 
@@ -942,7 +1001,7 @@ class LiveEngine:
         if not good_times:
             return None
 
-        return min(good_times)
+        return ref
 
     # -----------------------------------------------------
     # 1m fetch helper (B manage)
@@ -950,30 +1009,46 @@ class LiveEngine:
     def _fetch_latest_1m_rows(self, symbols):
         """
         symbols의 최신 1m 캔들(1개)을 가져옴.
-        - validate_and_format 적용
-        - 결과: {sym: pd.Series(row)} where row.name = datetime
+        ⚠️ 관리용 스냅샷이므로 validate_and_format 사용 금지
+        결과: {sym: pd.Series(row)} where row.name = datetime
         """
         out = {}
         for sym in symbols:
             try:
-                ohlcv = self.executor.exchange.fetch_ohlcv(sym, timeframe="1m", limit=3)
+                ohlcv = self.executor.exchange.fetch_ohlcv(
+                    sym, timeframe="1m", limit=2
+                )
                 if not ohlcv:
                     continue
-                df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                v = DataLoader.validate_and_format(df)
-                if v is None or v.empty:
+
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+
+                # 최소 안전성 체크만 수행
+                if df.empty or len(df) < 1:
                     continue
-                v = v.copy()
-                v["datetime"] = pd.to_datetime(v["timestamp"], unit="ms", errors="coerce")
-                v = v.dropna(subset=["datetime"]).set_index("datetime")
-                if v.empty:
+
+                if df[["open", "high", "low", "close"]].isna().any().any():
                     continue
-                # last complete candle row
-                row = v.iloc[-1]
-                row.name = v.index[-1]
+
+                # 시간 인덱스 구성
+                df["datetime"] = pd.to_datetime(
+                    df["timestamp"], unit="ms", errors="coerce"
+                )
+                df = df.dropna(subset=["datetime"]).set_index("datetime")
+                if df.empty:
+                    continue
+
+                # 가장 최근 캔들
+                row = df.iloc[-1]
+                row.name = df.index[-1]
                 out[sym] = row
+
             except Exception:
                 continue
+
         return out
 
     def _nearest_15m_indicators(self, sym, t):
@@ -1051,6 +1126,8 @@ class LiveEngine:
         ENTRY 로직은 절대 분기하지 않음.
         - 여기서 signal/sl/tp/score를 1회만 계산해서 리턴
         """
+        logger.info(f"🔍 ENTRY_SCAN_START | t={current_time_15m}")
+
         candidates = []
 
         if not self.data_map:
@@ -1068,7 +1145,54 @@ class LiveEngine:
             start = max(0, idx - 250)
             past_data = df.iloc[start: idx + 1]
 
+
+
+            # DEBUG: 입력 시점/지표 상태 확인
+            last_ts = past_data.index[-1]
+            req = ["adx", "st_dir", "st_val", "ema_daily", "ema_intra", "vol_ma", "rsi"]
+            snap = {c: (None if c not in past_data.columns else float(past_data[c].iloc[-1])) for c in req}
+            logger.info(f"🧪 PRE_ANALYZE | {sym} t={current_time_15m} last={last_ts} rows={len(past_data)} snap={snap}")
+
+
+
             signal, sl, tp = self.titan.analyze(sym, past_data)
+            # ================= DEBUG: ENTRY DECISION TRACE =================
+            curr = past_data.iloc[-1]
+            prev = past_data.iloc[-2] if len(past_data) >= 2 else curr
+
+            debug_struct = {
+                "retest_long": int(curr.get("retest_long", 0)),
+                "retest_short": int(curr.get("retest_short", 0)),
+                "mss_up": int(curr.get("mss_up", 0)),
+                "mss_down": int(curr.get("mss_down", 0)),
+                "recent_sweep_low": int(curr.get("recent_sweep_low", 0)),
+                "recent_sweep_high": int(curr.get("recent_sweep_high", 0)),
+                "last_pivot_high": float(curr.get("last_pivot_high", 0) or 0),
+                "last_pivot_low": float(curr.get("last_pivot_low", 0) or 0),
+            }
+
+            debug_filters = {
+                "ema_daily_ok": int(curr.get("ema_daily_ok", 0)),
+                "ema_daily": float(curr.get("ema_daily", 0) or 0),
+                "vol": float(prev.get("volume", 0) or 0),
+                "vol_ma": float(curr.get("vol_ma", 0) or 0),
+                "vol_factor": float(self.titan.params.get("vol_factor", 1.0)),
+                "adx": float(curr.get("adx", 0) or 0),
+                "adx_th": float(self.titan.params.get("adx_threshold", 0)),
+            }
+
+            logger.info(
+                f"🧪 ENTRY_DEBUG | {sym} | "
+                f"signal={signal} | "
+                f"struct={debug_struct} | "
+                f"filters={debug_filters}"
+            )
+            # ===============================================================
+
+
+
+            if not signal:
+                logger.info(f"⚪ NO_ENTRY | {sym}")
             if signal:
                 score = float(curr_row.get("adx", 0))
                 candidates.append({
@@ -1079,6 +1203,9 @@ class LiveEngine:
                     "tp": tp,
                     "row": curr_row,  # 15m row
                 })
+                logger.info(
+                f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} adx={score:.2f} sl={sl} tp={tp}"
+                )
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates
@@ -1260,6 +1387,7 @@ class LiveEngine:
                 # replicate open to each track
                 for t in self.tracks.values():
                     ok = t.open_position(
+                        
                         sym=sym,
                         signal=signal,
                         fill_px=float(fill_px),
@@ -1270,6 +1398,10 @@ class LiveEngine:
                     )
                     if ok:
                         entry_count[t.track_id] += 1
+                        logger.info(f"✅ ENTRY_ACCEPT | track={t.track_id} {sym}")
+                    else:
+                        logger.info(f"❌ ENTRY_REJECT | track={t.track_id} {sym}")
+
 
             # finalize: set entry bucket processed for all tracks
             for t in self.tracks.values():

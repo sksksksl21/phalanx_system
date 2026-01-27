@@ -1,24 +1,24 @@
 {
-  "positions": {
-    "ZKC/USDT:USDT": {
-      "side": "LONG",
-      "amount": 3346.0,
-      "entry_price": 0.1851,
-      "sl": 0.1552145529597081,
-      "tp1": 0.2047518829060982,
-      "next_sl": null,
-      "tp1_hit": false,
-      "entry_time": "2026-01-25 12:45:00",
-      "margin": 206.44819999999996
-    }
+  "positions": {},
+  "cooldowns": {
+    "XAG/USDT:USDT": "2026-01-26 22:00:28.081313+00:00",
+    "RIVER/USDT:USDT": "2026-01-26 20:30:23.988939+00:00",
+    "NOM/USDT:USDT": "2026-01-26 21:45:24.338106+00:00",
+    "ENSO/USDT:USDT": "2026-01-27 09:00:27.231694+00:00",
+    "RESOLV/USDT:USDT": "2026-01-27 09:15:25.720446+00:00"
   },
-  "cooldowns": {},
-  "consecutive_losses": {},
-  "paper_cash": 9793.2421277,
-  "paper_equity": 9990.9907277,
+  "consecutive_losses": {
+    "XAG/USDT:USDT": 1,
+    "RIVER/USDT:USDT": 0,
+    "NOM/USDT:USDT": 0,
+    "ENSO/USDT:USDT": 1,
+    "RESOLV/USDT:USDT": 1
+  },
+  "paper_cash": 9916.083423369915,
+  "paper_equity": 9916.083423369915,
   "paper_equity0": 10000.0,
-  "last_entry_bucket": 1965941,
+  "last_entry_bucket": 1966097,
   "last_manage_bucket": null,
-  "last_processed_entry_time": "2026-01-25 13:00:00",
+  "last_processed_entry_time": "2026-01-27 04:15:00",
   "last_processed_manage_time": null
 }

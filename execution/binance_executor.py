@@ -1,10 +1,6 @@
 # execution/binance_executor.py
 # =========================================================
 # [Phalanx Execution Module] BinanceExecutor (Live)
-# Role: Real Order Execution + Accounting Bridge
-# Design Goal:
-# - VirtualExecutor와 **동일한 인터페이스 / 상태 모델**
-# - 차이는 단 하나: 체결이 "가상"이 아니라 "실제"
 # =========================================================
 
 import logging
@@ -13,10 +9,9 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-
 logger = logging.getLogger("PhalanxBinance")
 
-BASE_FEE = 0.0005  # 백테스트와 동일 (실제 수수료는 체결 응답 우선)
+BASE_FEE = 0.0005
 
 
 class BinanceExecutor:
@@ -25,7 +20,6 @@ class BinanceExecutor:
     - positions 구조는 VirtualExecutor와 동일
     - LiveEngine은 Executor가 Virtual/Binance인지 구분하지 않는다
     """
-
 
     def __init__(self, config):
         self.cfg = config
@@ -50,7 +44,6 @@ class BinanceExecutor:
             }
         })
 
-        # 초기 잔고 동기화
         self._sync_balance()
 
     # ======================================================
@@ -107,15 +100,7 @@ class BinanceExecutor:
                     if status and status not in ("TRADING", "1"):
                         continue
 
-            vol = 0.0
-            if isinstance(t, dict):
-                vol = t.get("quoteVolume", 0) or 0
-
-            try:
-                vol = float(vol)
-            except Exception:
-                vol = 0.0
-
+            vol = float(t.get("quoteVolume", 0) or 0)
             if vol > 0:
                 targets.append((s, vol))
 
@@ -123,15 +108,13 @@ class BinanceExecutor:
         return [t[0] for t in targets][:20]
 
     # ======================================================
-
-
-
+    # Historical OHLCV (15m)
+    # ======================================================
     def prepare_data(self, symbols, days=30, timeframe="15m", limit=1000):
         if symbols is None:
             return {}
 
         try:
-            # markets 로딩은 시도만 (실패해도 진행)
             try:
                 self.exchange.load_markets()
             except Exception as e:
@@ -150,7 +133,6 @@ class BinanceExecutor:
                         ohlcv = self.exchange.fetch_ohlcv(sym, timeframe, since=temp_since, limit=limit)
                     except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
                         retries -= 1
-                        logger.warning(f"Network/Timeout on {sym}: {e} (retries left={retries})")
                         if retries <= 0:
                             all_ohlcv = []
                             break
@@ -164,7 +146,6 @@ class BinanceExecutor:
                     if not ohlcv:
                         break
 
-                    # 중복/역행 방지
                     last_ts = ohlcv[-1][0]
                     if all_ohlcv and last_ts <= all_ohlcv[-1][0]:
                         break
@@ -178,10 +159,13 @@ class BinanceExecutor:
                     time.sleep(0.2)
 
                 if all_ohlcv:
-                    df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df = pd.DataFrame(
+                        all_ohlcv,
+                        columns=["timestamp", "open", "high", "low", "close", "volume"]
+                    )
                     data_map[sym] = df
 
-                time.sleep(0.3)  # 심볼 간 쿨다운
+                time.sleep(0.3)
 
             return data_map
 
@@ -189,8 +173,49 @@ class BinanceExecutor:
             logger.error(f"prepare_data failed: {e}")
             return {}
 
+    # ======================================================
+    # 🔹 NEW: 1m SNAPSHOT FETCH (관리 전용)
+    # ======================================================
+    def fetch_latest_1m_rows(self, symbols):
+        """
+        1m 관리용 스냅샷.
+        - validate 없음
+        - 최신 캔들 1개 반환
+        return: {symbol: pd.Series}
+        """
+        out = {}
 
+        for sym in symbols:
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(sym, timeframe="1m", limit=2)
+                if not ohlcv:
+                    continue
 
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+
+                if df.empty:
+                    continue
+                if df[["open", "high", "low", "close"]].isna().any().any():
+                    continue
+
+                df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+                df = df.dropna(subset=["datetime"]).set_index("datetime")
+                if df.empty:
+                    continue
+
+                row = df.iloc[-1]
+                row.name = df.index[-1]
+                out[sym] = row
+
+            except Exception:
+                continue
+
+        return out
+
+    # ======================================================
     # Equity (MTM)
     # ======================================================
     def update_equity(self, current_prices):
@@ -212,44 +237,27 @@ class BinanceExecutor:
     # 🔒 LIVE SAFETY: FETCH REAL POSITIONS
     # ======================================================
     def fetch_positions(self):
-        """
-        실계좌 선물 포지션 조회 (one-way 기준)
-        return:
-        {
-          'BTC/USDT:USDT': {'side': 'LONG', 'amount': 0.01},
-          'ETH/USDT:USDT': {'side': 'SHORT', 'amount': 0.5}
-        }
-        """
         positions = {}
-
         try:
             account = self.exchange.fetch_balance()
             raw_positions = account.get("info", {}).get("positions", [])
 
             for p in raw_positions:
-                try:
-                    amt = float(p.get("positionAmt", 0))
-                    if amt == 0:
-                        continue
-
-                    symbol = p.get("symbol")
-                    if not symbol:
-                        continue
-
-                    # Binance FUTURES symbol normalize: BTCUSDT -> BTC/USDT:USDT
-                    if symbol.endswith("USDT"):
-                        sym = symbol.replace("USDT", "/USDT:USDT")
-                    else:
-                        continue
-
-                    side = "LONG" if amt > 0 else "SHORT"
-
-                    positions[sym] = {
-                        "side": side,
-                        "amount": abs(amt)
-                    }
-                except Exception:
+                amt = float(p.get("positionAmt", 0))
+                if amt == 0:
                     continue
+
+                symbol = p.get("symbol")
+                if not symbol or not symbol.endswith("USDT"):
+                    continue
+
+                sym = symbol.replace("USDT", "/USDT:USDT")
+                side = "LONG" if amt > 0 else "SHORT"
+
+                positions[sym] = {
+                    "side": side,
+                    "amount": abs(amt)
+                }
 
         except Exception as e:
             logger.error(f"fetch_positions failed: {e}")
@@ -263,15 +271,10 @@ class BinanceExecutor:
         try:
             side_ccxt = "buy" if side == "LONG" else "sell"
             amt = self.amount_to_precision(symbol, amount)
-
             if amt <= 0:
                 return None
 
-            order = self.exchange.create_market_order(
-                symbol=symbol,
-                side=side_ccxt,
-                amount=amt
-            )
+            order = self.exchange.create_market_order(symbol, side_ccxt, amt)
 
             for _ in range(5):
                 order = self.exchange.fetch_order(order["id"], symbol)
@@ -286,12 +289,9 @@ class BinanceExecutor:
 
             filled_price = cost / filled if cost > 0 else float(order.get("average", 0))
 
-            fee_cost = 0.0
             fee_info = order.get("fee")
             if isinstance(fee_info, dict):
                 fee_cost = float(fee_info.get("cost", 0))
-            elif isinstance(order.get("fees"), list) and order["fees"]:
-                fee_cost = sum(float(f.get("cost", 0)) for f in order["fees"])
             else:
                 fee_cost = filled_price * filled * BASE_FEE
 
