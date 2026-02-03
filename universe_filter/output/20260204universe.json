@@ -1,0 +1,46 @@
+{
+  "asof": "2026-02-02T00:00:00+00:00",
+  "rebalance_rule": "WEEKLY",
+  "universe": [
+    "DASH/USDT:USDT",
+    "PIPPIN/USDT:USDT",
+    "WLD/USDT:USDT",
+    "FHE/USDT:USDT",
+    "ZEC/USDT:USDT",
+    "HYPE/USDT:USDT",
+    "SOL/USDT:USDT",
+    "ENA/USDT:USDT",
+    "RIVER/USDT:USDT",
+    "FARTCOIN/USDT:USDT",
+    "XRP/USDT:USDT",
+    "WIF/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "LTC/USDT:USDT",
+    "AXS/USDT:USDT",
+    "AUCTION/USDT:USDT",
+    "XMR/USDT:USDT",
+    "UAI/USDT:USDT",
+    "TRUMP/USDT:USDT",
+    "AAVE/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "SUI/USDT:USDT",
+    "TAO/USDT:USDT",
+    "C98/USDT:USDT",
+    "LIT/USDT:USDT"
+  ],
+  "meta": {
+    "n_selected": 25,
+    "model": "RandomForestClassifier",
+    "windows_days": [
+      7,
+      30,
+      90
+    ],
+    "objective": [
+      "mdd_down",
+      "trade_count_std_down",
+      "holding_iqr_down"
+    ],
+    "zombie_N_days": 1
+  }
+}

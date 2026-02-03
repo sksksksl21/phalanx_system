@@ -140,6 +140,57 @@ class LiveEngine:
             raise RuntimeError("config.json must be a JSON object")
         return cfg
 
+        # --- [UF] enable flag ---
+    def _is_uf_enabled(self) -> bool:
+        try:
+            return bool(self.cfg.get("system_settings", {}).get("use_universe_filter", False))
+        except Exception:
+            return False
+
+    # --- [UF] read universe file (JSON) ---
+    def _get_universe_from_json(self) -> list:
+        """
+        UF는 엔진 밖에서 돌고, LIVE는 결과 JSON만 읽는다.
+        기본 경로:
+          - config: system_settings.universe_selected_path
+          - default: <root_dir>/universe_selected.json
+        JSON 예:
+          {"asof":"2026-02-03","rebalance":"daily","symbols":[...], "top_n":25}
+        """
+        try:
+            path = self.cfg.get("system_settings", {}).get("universe_selected_path", None)
+        except Exception:
+            path = None
+
+        if not path:
+            path = os.path.join(self.root_dir, "universe_selected.json")
+
+        if not os.path.exists(path):
+            return []
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f) or {}
+        except Exception:
+            return []
+
+        syms = obj.get("symbols", []) or []
+        if not isinstance(syms, list):
+            return []
+
+        out = []
+        for s in syms:
+            try:
+                ss = str(s).strip()
+                if ss:
+                    out.append(ss)
+            except Exception:
+                continue
+        return out
+
+
+
+
     def __init__(self):
         # paths
         self.root_dir = root_dir
@@ -625,8 +676,18 @@ class LiveEngine:
     # Data preparation (15m)
     # -----------------------------------------------------
     def prepare_data(self):
-        targets = self.executor.get_top_targets() or []
-        logger.info(f"📡 MARKET_SCAN | targets={targets[:10]} (top10)")
+                # ✅ UF JSON 우선 (enabled일 때만)
+        if self._is_uf_enabled():
+            targets = self._get_universe_from_json() or []
+            if not targets:
+                targets = self.executor.get_top_targets() or []
+                logger.info(f"📡 MARKET_SCAN | UF_EMPTY -> fallback top_targets={targets[:10]} (top10)")
+            else:
+                logger.info(f"📡 MARKET_SCAN | UF_JSON targets={targets[:10]} (top10)")
+        else:
+            targets = self.executor.get_top_targets() or []
+            logger.info(f"📡 MARKET_SCAN | targets={targets[:10]} (top10)")
+
 
         filtered = []
         for sym in targets:

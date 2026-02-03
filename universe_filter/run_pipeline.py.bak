@@ -1,0 +1,38 @@
+# =========================================================
+# Universe Filter - Pipeline Runner (ENTRYPOINT)
+# ---------------------------------------------------------
+# Generated: 2026-02-03T13:29:24Z
+#
+# HARD RULES (v1.0):
+# - Strategy logic (entry/positioning/exit) MUST NOT be modified.
+# - UF MUST output ONLY universe.json for engine consumption.
+# - All files MUST live under universe_filter/.
+# - Pipeline is step-by-step; each step is a single runnable module.
+# - Only Step 05 writes output/universe.json.
+# =========================================================
+
+"""
+Role
+----
+Sequentially runs Step 00 ~ Step 05.
+This file is the ONLY pipeline entrypoint.
+Implementation will be added later; header only for now.
+
+Inputs
+------
+- universe_filter/input/backtest_history.csv
+- (optional) universe_filter/input/ohlcv/*
+- universe_filter/config/uf_config.json
+
+Outputs
+-------
+- universe_filter/output/universe.json (written by Step 05 only)
+- universe_filter/output/run_report.json
+- universe_filter/output/decision_table.csv
+- universe_filter/output/cache/*
+
+Notes
+-----
+- Do NOT implement strategy logic here.
+- Orchestrates steps only; each step is a standalone runnable module.
+"""

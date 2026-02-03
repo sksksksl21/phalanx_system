@@ -33,17 +33,17 @@ class TitanStrategy:
         self.params = {
             # --- 15분봉(Intraday) 설정 ---
             "atr_period": 25,
-            "atr_multiplier": 2.5,
-            "adx_threshold": 16,  # (옵션) 필터로만 사용
-            "rsi_upper": 71,      # (옵션) 필터로만 사용
-            "rsi_lower": 36,      # (옵션) 필터로만 사용
-            "vol_factor": 1.0,
+            "atr_multiplier": 4.5,
+            "adx_threshold": 17,  # (옵션) 필터로만 사용
+            "rsi_upper": 73,      # (옵션) 필터로만 사용
+            "rsi_lower": 28,      # (옵션) 필터로만 사용
+            "vol_factor": 0.9,
             "ema_intraday": 200,
             # --- 일봉(Daily) 설정 ---
-            "daily_ema": 25,
+            "daily_ema": 5,
 
             # --- Market Structure / Liquidity 설정 ---
-            "swing_len": 5,               # pivot 길이 (프랙탈)
+            "swing_len": 3,               # pivot 길이 (프랙탈)
             "context_lookback": 120,      # 최근 N봉에서 스윕/구조 이벤트 추적
             "retest_tolerance_atr": 0.25, # retest 레벨 허용오차(ATR 비율)
             "use_daily_filter": True,     # 일봉 EMA 필터 사용 여부

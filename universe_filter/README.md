@@ -1,0 +1,21 @@
+# Universe Filter (UF) v1.0
+
+_Generated: {UTC_NOW}_
+
+## Hard Rules
+- Strategy logic (entry/positioning/exit) MUST NOT be modified.
+- UF outputs ONLY `output/universe.json` for engine consumption.
+- All files live under `universe_filter/`.
+- Pipeline is step-by-step: `steps/step_00` ~ `steps/step_05`.
+- Only Step 05 writes `output/universe.json`.
+
+## Entry point
+- `python universe_filter/run_pipeline.py`
+
+## Inputs
+- Required: `input/backtest_history.csv`
+- Optional: `input/ohlcv/*` (if missing, OHLCV features are skipped safely)
+
+## Outputs
+- Required: `output/universe.json` (Step05 only)
+- Recommended: `output/decision_table.csv`, `output/run_report.json`

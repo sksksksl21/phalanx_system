@@ -1,0 +1,47 @@
+{
+  "_comment": "Run report placeholder. Steps append execution metadata and validation results here.",
+  "step_00": {
+    "n_rows": 1231,
+    "n_entry": 620,
+    "n_exit": 611,
+    "n_trades": 611,
+    "missing_exit": 9,
+    "orphan_exit": 0
+  },
+  "step_01": {
+    "median_spearman_rank": 0.2292483493332927,
+    "policy_hint": "normal"
+  },
+  "step_02": {
+    "asof_points": 3,
+    "rows_dataset": 251
+  },
+  "step_03": {
+    "lambda": 0.09614446988533906,
+    "features_used": [
+      "net_profit_7d",
+      "trade_count_7d",
+      "winrate_7d",
+      "avg_loss_7d",
+      "equity_mdd_7d",
+      "holding_iqr_7d",
+      "avg_win_7d",
+      "profit_factor_7d",
+      "net_profit_30d",
+      "winrate_30d",
+      "avg_win_30d",
+      "profit_factor_30d"
+    ],
+    "labeled_rows": 202,
+    "decision_rows": 251
+  },
+  "step_04": {
+    "latest_asof": "2026-02-02T00:00:00+00:00",
+    "n_selected": 18
+  },
+  "step_05": {
+    "universe_written": true,
+    "n": 18,
+    "zombie_N_days": 1
+  }
+}

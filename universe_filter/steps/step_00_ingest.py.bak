@@ -1,0 +1,32 @@
+# =========================================================
+# Step 00 - Ingest & Normalize
+# ---------------------------------------------------------
+# Generated: 2026-02-03T13:29:24Z
+#
+# HARD RULES (v1.0):
+# - Strategy logic (entry/positioning/exit) MUST NOT be modified.
+# - UF MUST output ONLY universe.json for engine consumption.
+# - All files MUST live under universe_filter/.
+# - Pipeline is step-by-step; each step is a single runnable module.
+# - Only Step 05 writes output/universe.json.
+# =========================================================
+
+"""
+Role
+----
+Converts input/backtest_history.csv into normalized Trade Ledger with trade_id and holding period.
+
+Inputs
+------
+- universe_filter/input/backtest_history.csv
+
+Outputs
+-------
+- universe_filter/output/cache/trades.parquet
+- (report additions) universe_filter/output/run_report.json
+
+Notes
+-----
+- Match ENTRY~EXIT into trade_id per (symbol, side).
+- Record edge cases (missing EXIT, duplicates) into run_report (do not stop pipeline).
+"""

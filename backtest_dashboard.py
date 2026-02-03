@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import os
 
+
 st.set_page_config(page_title="Phalanx Backtest Dashboard", layout="wide")
 
 DEFAULT_INITIAL_EQUITY = 10000.0
@@ -216,7 +217,7 @@ def main():
             color="Series",
             title="Equity Curve (Event vs MTM)",
         )
-        st.plotly_chart(fig_eq, use_container_width=True)
+        st.plotly_chart(fig_eq, width='stretch')
 
         # Drawdown overlay (computed per series)
         st.subheader("Drawdown Curves (Overlay)")
@@ -244,7 +245,7 @@ def main():
         if dd_frames:
             dd_all = pd.concat(dd_frames, ignore_index=True)
             fig_dd = px.line(dd_all, x="Datetime", y="dd", color="Series", title="Drawdown (%) (Event vs MTM)")
-            st.plotly_chart(fig_dd, use_container_width=True)
+            st.plotly_chart(fig_dd, width='stretch')
         else:
             st.info("Drawdown 표시를 위한 데이터가 부족합니다.")
 
@@ -258,7 +259,7 @@ def main():
             bar_df = sym_pnl.reset_index()
             bar_df.columns = ["Symbol", "PnL"]
             fig_bar = px.bar(bar_df, x="PnL", y="Symbol", orientation="h", title="PnL by Symbol (EXIT Sum)")
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width='stretch')
 
             # Trade PnL scatter
             scat = exits.copy()
@@ -271,11 +272,11 @@ def main():
                 size="abs_pnl",
                 title="Trade PnL Distribution (EXIT)",
             )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width='stretch')
 
     with tab3:
         st.subheader("Trade Log (Filtered)")
-        st.dataframe(df_view.sort_values(by="Datetime", ascending=False), use_container_width=True)
+        st.dataframe(df_view.sort_values(by="Datetime", ascending=False), width='stretch')
 
         st.caption(f"Trade CSV: {trade_path}")
         if os.path.exists(mtm_path):

@@ -1,11 +1,10 @@
-# core/backtest_engine_B.py
-
 import sys
 import os
 import json
 import logging
 import pandas as pd
 import numpy as np
+import math
 
 # 상위 경로 설정
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,8 +25,7 @@ logger = logging.getLogger("PhalanxBacktest")
 
 try:
     from strategy.titan_strategy import TitanStrategy
-    # ✅ B는 VirtualExecutorB를 써야 1m exit 계약이 성립한다.
-    from execution.virtual_executor_B import VirtualExecutorB
+    from execution.virtual_executor import VirtualExecutor
 except ImportError as e:
     logger.critical(f"❌ Module Import Error: {e}")
     sys.exit(1)
@@ -35,9 +33,13 @@ except ImportError as e:
 
 class BacktestEngine:
     """
-    [Phalanx Core Module] Backtest Orchestrator (B)
-    - 15m entry
-    - 1m exit-only touch check (SL/TP)
+    [Phalanx Core Module] Backtest Orchestrator
+    Mode: Time-Sequential & Priority-Based (Deterministic)
+
+    FIXES:
+    - Equity 정의 통일(선물 마진 회계): equity = cash + Σ(margin + unrealized_pnl)
+    - Event 로그에 Cash/Equity 명확히 기록하여 대시보드 튐 제거
+    - ENTRY/EXIT 직후에도 전체 심볼 가격으로 MTM 평가(단일 심볼 update 제거)
     """
 
     def __init__(self, days=30):
@@ -54,14 +56,21 @@ class BacktestEngine:
 
         # 1. 전략 및 실행기 초기화
         self.titan = TitanStrategy()
-        self.executor = VirtualExecutorB()
+        self.executor = VirtualExecutor()
 
         # [Safety] 초기 자본금 강제 주입
         if not hasattr(self.executor, 'initial_balance'):
             self.executor.initial_balance = 10000.0
-        # 초기 상태도 강제 정합
-        self.executor.cash = float(getattr(self.executor, "cash", self.executor.initial_balance))
-        self.executor.equity = float(getattr(self.executor, "equity", self.executor.initial_balance))
+        if not hasattr(self.executor, 'cash'):
+            self.executor.cash = float(self.executor.initial_balance)
+        if not hasattr(self.executor, 'equity'):
+            self.executor.equity = float(self.executor.initial_balance)
+        if not hasattr(self.executor, 'positions'):
+            self.executor.positions = {}
+        if not hasattr(self.executor, 'history'):
+            self.executor.history = []
+        if not hasattr(self.executor, 'equity_curve'):
+            self.executor.equity_curve = []
 
         self.risk_ctrl = RiskControl(self.executor, self.cfg)
         self.monitor = PositionMonitor()
@@ -72,25 +81,22 @@ class BacktestEngine:
 
         self.symbols = []  # 외부 주입 심볼 저장소
 
+        # 마지막 MTM 평가용 가격 스냅샷
+        self.last_prices = {}  # {sym: close}
+
         # Config 강제 주입
         strat_settings = self.cfg.get('strategy_settings', {})
         if 'blacklist' in strat_settings:
             self.titan.blacklist = set(strat_settings['blacklist'])
             print(f"🚫 [System] Configured Blacklist: {self.titan.blacklist}")
 
-        # 로그 파일 초기화
+        # 로그 파일 초기화 (Cash/Equity 분리 저장)
         self.log_file = os.path.join(root_dir, "backtest_history.csv")
         with open(self.log_file, 'w', encoding="utf-8") as f:
-            f.write("Datetime,Symbol,Side,Type,Price,Amount,PnL,Balance,Reason\n")
+            f.write("Datetime,Symbol,Side,Type,Price,Amount,PnL,Cash,Equity,Reason\n")
 
         # MTM Equity Curve CSV 경로 (대시보드용)
         self.equity_curve_file = os.path.join(root_dir, "backtest_equity_curve.csv")
-
-        # (B) required cols
-        self.required_cols = [
-            "open", "high", "low", "close", "volume",
-            "atr", "vol_ma", "ema_intra", "rsi", "adx", "st_val", "st_dir"
-        ]
 
     def _load_config(self):
         if not os.path.exists(self.config_path):
@@ -122,12 +128,60 @@ class BacktestEngine:
         return pd.Timedelta(minutes=default_minutes)
 
     # =========================================================
+    # ✅ Equity 계산 공식 강제 통일 (선물 마진 회계)
+    # =========================================================
+    def _force_mark_to_market_equity(self, prices: dict) -> float:
+        """
+        강제 MTM:
+        equity = cash + Σ(position.margin + unrealized_pnl)
+        - margin은 '묶인 내 돈'이라 equity에 포함
+        - unrealized는 side에 따라 계산
+        """
+        cash = float(getattr(self.executor, "cash", 0.0))
+        positions = getattr(self.executor, "positions", {}) or {}
+
+        total = cash
+        for sym, pos in positions.items():
+            try:
+                if sym not in prices:
+                    continue
+                px = float(prices[sym])
+                entry = float(pos.get("entry_price", 0.0))
+                amt = float(pos.get("amount", 0.0))
+                side = str(pos.get("side", "LONG")).upper()
+                margin = float(pos.get("margin", 0.0))
+
+                if side == "LONG":
+                    upnl = (px - entry) * amt
+                else:
+                    upnl = (entry - px) * amt
+
+                total += margin + upnl
+            except Exception:
+                continue
+
+        self.executor.equity = float(total)
+        return float(total)
+
+    def _sync_equity(self, prices: dict):
+        """
+        - VirtualExecutor.update_equity()가 있으면 호출해도 되지만,
+          최종 값은 엔진에서 강제 공식으로 덮어쓴다.
+        """
+        try:
+            if hasattr(self.executor, "update_equity"):
+                self.executor.update_equity(prices)
+        except Exception:
+            pass
+        self._force_mark_to_market_equity(prices)
+
+    # =========================================================
     # 1. Data Preparation Layer
     # =========================================================
     def prepare_data(self, symbols=None):
         """
         - raw_data_map이 이미 있으면 재다운로드하지 않는다.
-        - B: 15m raw 로딩 후, 1m 데이터도 (exit-only) 준비한다.
+        - 다만, 지표(data_map)는 trial마다 바뀔 수 있으므로 rebuild_indicators()로 재생성한다.
         """
         if self.raw_data_map and len(self.raw_data_map) > 0:
             return self.raw_data_map
@@ -152,7 +206,7 @@ class BacktestEngine:
 
         targets = filtered_targets
 
-        raw_data_map = self.executor.prepare_data(targets, days=self.test_days)
+        raw_data_map = self.executor.prepare_data(targets)
 
         if not raw_data_map:
             logger.error("❌ No Data Loaded.")
@@ -163,15 +217,6 @@ class BacktestEngine:
 
         logger.info(f"✅ Raw Data Ready: {len(self.raw_data_map)} symbols loaded.")
         self.symbols = list(self.raw_data_map.keys())
-
-        # ✅ (B 핵심) 1m 데이터 준비 (EXIT ONLY)
-        try:
-            logger.info("📥 [Data Loader] Fetching 1m Data (Exit Only)...")
-            self.executor.prepare_data_1m(self.symbols, days=self.test_days)
-        except Exception as e:
-            # 1m이 일부 실패해도 15m 시뮬은 진행 가능 (해당 심볼은 1m exit 미적용)
-            logger.error(f"❌ Failed to prepare 1m data (continue): {e}")
-
         return self.raw_data_map
 
     def rebuild_indicators(self):
@@ -181,6 +226,11 @@ class BacktestEngine:
         - 심볼별 warmup으로 슬라이스
         """
         self.data_map = {}
+
+        self.required_cols = [
+            "open", "high", "low", "close", "volume",
+            "atr", "vol_ma", "ema_intra", "rsi", "adx", "st_val", "st_dir"
+        ]
 
         temp_map = {}
         warmup_map = {}
@@ -243,10 +293,56 @@ class BacktestEngine:
 
         logger.info(f"Indicators Ready: {len(self.data_map)} symbols processed.")
 
-    def _log_csv(self, dt, sym, side, type_note, price, amt, pnl, balance, reason):
-        line = f"{dt},{sym},{side},{type_note},{price},{amt},{pnl:.4f},{balance:.2f},{reason}\n"
+    def _log_csv(self, dt, sym, side, type_note, price, amt, pnl, reason):
+        cash = float(getattr(self.executor, "cash", 0.0))
+        eq = float(getattr(self.executor, "equity", cash))
+        line = f"{dt},{sym},{side},{type_note},{price},{amt},{pnl:.4f},{cash:.2f},{eq:.2f},{reason}\n"
         with open(self.log_file, 'a', encoding="utf-8") as f:
             f.write(line)
+    def _get_sl_apply_mode(self) -> str:
+        """
+        LIVE와 동일하게 config에서 sl 적용 모드 읽기
+        - "next": next_sl 저장 후 다음 캔들에 sl 승계
+        - "same": 같은 캔들(확정봉)에서 sl 즉시 반영 + 히트판정도 new_sl 기준(모니터에서 처리)
+        """
+        try:
+            mode = str(self.cfg.get("system_settings", {}).get("sl_apply_mode", "next")).strip().lower()
+        except Exception:
+            mode = "next"
+        return mode if mode in ("next", "same") else "next"
+
+
+    def _get_sl_strategy(self) -> str:
+        """
+        PositionMonitor의 sl_strategy를 config에서 읽는다.
+        허용: supertrend | atr_trail | profit_lock | hybrid | armor
+        """
+        try:
+            strat = str(self.cfg.get("system_settings", {}).get("sl_strategy", "supertrend")).strip().lower()
+        except Exception:
+            strat = "supertrend"
+
+        allowed = {"supertrend", "atr_trail", "profit_lock", "hybrid", "armor"}
+        return strat if strat in allowed else "supertrend"
+
+    def _get_sl_params(self) -> dict:
+        """
+        PositionMonitor의 sl_params를 config에서 읽는다.
+        예)
+        system_settings:
+          sl_params:
+            atr_mult: 3.0
+            trigger_atr: 2.0
+            lock_atr: 0.5
+        """
+        try:
+            p = self.cfg.get("system_settings", {}).get("sl_params", {}) or {}
+            return p if isinstance(p, dict) else {}
+        except Exception:
+            return {}
+
+
+
 
     # =========================================================
     # 2. Simulation Loop
@@ -260,6 +356,9 @@ class BacktestEngine:
         if not self.data_map:
             logger.error("❌ Cannot start backtest: No Data.")
             return
+
+        # ✅ SL 적용 모드(전 구간 고정) — LIVE와 동일
+        apply_mode = self._get_sl_apply_mode()
 
         fixed_symbols = sorted(list(self.data_map.keys()))
 
@@ -282,7 +381,6 @@ class BacktestEngine:
         if common_timeline is None or len(common_timeline) < 200:
             logger.error("Not enough synchronized data (common timeline too short). Fallback to base timeline.")
 
-            # fallback base 심볼 선택
             base_sym = None
             base_len = -1
             for s in fixed_symbols:
@@ -306,7 +404,6 @@ class BacktestEngine:
             logger.error("❌ Candidate timeline too short.")
             return
 
-        # candidate 전체 구간 reindex/ffill 후 max_start부터 사용
         aligned_full_map = {}
         usable_syms = []
         for sym in fixed_symbols:
@@ -358,95 +455,57 @@ class BacktestEngine:
 
         # [Reset]
         self.executor.history = []
-        self.executor.cash = self.executor.initial_balance
-        self.executor.equity = self.executor.initial_balance
+        self.executor.cash = float(self.executor.initial_balance)
+        self.executor.equity = float(self.executor.initial_balance)
         self.executor.positions = {}
         self.executor.equity_curve = []
         self.cooldowns = {}
         self.consecutive_losses = {}
+        self.last_prices = {}
 
         sim_times = timeline[200:]
         if len(sim_times) < 200:
             logger.error(f"❌ Not enough simulation steps after warmup: {len(sim_times)}")
             return
 
-        # ✅ (B 핵심) 1m EXIT 중복스캔 방지용: 포지션별 마지막 체크 구간 관리
-        # - entry_time부터 매번 current_time까지 스캔하면, 1) 느려지고 2) 겹친 구간 재스캔으로 이상해질 수 있음
-        # - 그래서 pos['last_1m_check']를 둔다.
         for current_time in sim_times:
             current_rows = {}
             current_prices = {}
+
             for sym in fixed_symbols:
                 row = self.data_map[sym].loc[current_time]
                 current_rows[sym] = row
                 current_prices[sym] = float(row["close"])
 
-            # sizing 기준 통일: 먼저 equity 업데이트
-            self.executor.update_equity(current_prices)
+            self.last_prices = dict(current_prices)
 
-            # =====================================================
-            # (B) Step 0: 1m EXIT 우선 적용 (SL/TP 터치)
-            # =====================================================
-            # positions dict를 직접 도는 중에 삭제되므로 list()로 복사해서 순회
-            for sym in list(self.executor.positions.keys()):
-                pos = self.executor.positions.get(sym)
-                if not pos:
-                    continue
+            # ✅ sizing 기준 통일: 먼저 equity 업데이트(강제 MTM)
+            self._sync_equity(current_prices)
 
-                # 1m 데이터가 없는 심볼은 패스 (이 심볼은 15m 관리만)
-                if not hasattr(self.executor, "check_exit_1m"):
-                    break
-
-                start_dt = pos.get("last_1m_check", pos.get("entry_time", None))
-                if start_dt is None:
-                    start_dt = current_time - self.bar_td  # fallback
-
-                end_dt = current_time
-
-                try:
-                    hit = self.executor.check_exit_1m(sym, start_dt, end_dt)
-                except Exception:
-                    hit = None
-
-                if hit:
-                    # hit 계약: ("EXIT", ts, price, reason)
-                    try:
-                        _, ts, price, reason = hit
-                    except Exception:
-                        # 계약 깨진 경우는 그냥 무시 (터지지 않게)
-                        continue
-
-                    # 내부 _execute_exit로 처리해야 cooldown/log가 A와 동일하게 적용됨
-                    pos_now = self.executor.positions.get(sym)
-                    if pos_now:
-                        self._execute_exit(sym, pos_now, float(price), str(reason), ts)
-
-                    # 다음 심볼로
-                    continue
-
-                # 이번 구간까지 체크 완료 표시(중복 스캔 방지)
-                pos2 = self.executor.positions.get(sym)
-                if pos2:
-                    pos2["last_1m_check"] = end_dt
-
-            # Step 1: 포지션 관리 (15m PositionMonitor)
+            # Step 1: 포지션 관리
             for sym in fixed_symbols:
                 if sym not in self.executor.positions:
                     continue
 
                 curr_row = current_rows[sym]
-
-                # 다음 캔들부터 SL 적용
                 pos = self.executor.positions[sym]
-                if 'next_sl' in pos and pos['next_sl'] is not None:
-                    try:
-                        if float(pos['next_sl']) != float(pos.get('sl', 0)):
-                            pos['sl'] = float(pos['next_sl'])
-                    except Exception:
-                        pass
-                    pos.pop('next_sl', None)
 
-                self._process_existing_position(sym, curr_row, None)
+                # ✅ next_sl 승계는 "next 모드"에서만
+                if apply_mode == "next":
+                    if 'next_sl' in pos and pos['next_sl'] is not None:
+                        try:
+                            if float(pos['next_sl']) != float(pos.get('sl', 0)):
+                                pos['sl'] = float(pos['next_sl'])
+                        except Exception:
+                            pass
+                        pos.pop('next_sl', None)
+                else:
+                    # same 모드에서는 next_sl 혼입 방지
+                    if 'next_sl' in pos and pos['next_sl'] is not None:
+                        pos.pop('next_sl', None)
+
+                # ✅ apply_mode 전달
+                self._process_existing_position(sym, curr_row, None, apply_mode=apply_mode)
 
             # Step 2: 신규 진입 후보
             candidates = []
@@ -472,13 +531,17 @@ class BacktestEngine:
                 start_idx = max(0, curr_idx_int - 250)
                 past_data = df.iloc[start_idx: curr_idx_int + 1]
 
-                signal, sl_price, tp_price = self.titan.analyze(sym, past_data)
+                signal, sl_price, _tp_price = self.titan.analyze(sym, past_data)  # tp는 무시
 
                 if signal:
                     score = float(curr_row.get('adx', 0))
                     candidates.append({
-                        'score': score, 'sym': sym, 'signal': signal,
-                        'sl': sl_price, 'tp': tp_price, 'row': curr_row
+                        'score': score,
+                        'sym': sym,
+                        'signal': signal,
+                        'sl': sl_price,
+                        'row': curr_row,
+                        'prices': current_prices
                     })
 
             candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -486,13 +549,19 @@ class BacktestEngine:
             for cand in candidates:
                 if len(self.executor.positions) >= self.executor.MAX_POSITIONS:
                     break
-                self._process_entry(cand['sym'], cand['signal'], cand['sl'], cand['tp'], cand['row'])
+                self._process_entry(
+                    cand['sym'],
+                    cand['signal'],
+                    cand['sl'],
+                    cand['row'],
+                    cand['prices']
+                )
 
-            # MTM 최종 업데이트
-            self.executor.update_equity(current_prices)
-            self.executor.equity_curve.append({'dt': current_time, 'equity': self.executor.equity})
+            # MTM 최종 업데이트 (강제 MTM)
+            self._sync_equity(current_prices)
+            self.executor.equity_curve.append({'dt': current_time, 'equity': float(self.executor.equity)})
 
-        # Equity curve save
+        # Equity curve save (이하 기존 그대로)
         try:
             if getattr(self.executor, "equity_curve", None):
                 df_curve = pd.DataFrame(self.executor.equity_curve).copy()
@@ -514,16 +583,26 @@ class BacktestEngine:
             except Exception as e:
                 logger.error(f"❌ Report Error: {e}")
 
-    def _process_entry(self, sym, signal, sl, tp, curr_row):
+    def _process_entry(self, sym, signal, sl, curr_row, current_prices: dict):
+        # ✅ 0) signal 정규화 (필수)
+        sig = str(signal).strip().upper()
+        alias = {
+            "BUY": "LONG", "LONG": "LONG", "BULL": "LONG",
+            "SELL": "SHORT", "SHORT": "SHORT", "BEAR": "SHORT",
+        }
+        sig = alias.get(sig, sig)
+        if sig not in ("LONG", "SHORT"):
+            return
+
         atr = curr_row.get('atr', curr_row['close'] * 0.01)
         slippage = atr * SLIPPAGE_ATR_FACTOR
+        entry_price = curr_row['close'] + slippage if sig == 'LONG' else curr_row['close'] - slippage
 
-        entry_price = curr_row['close'] + slippage if signal == 'LONG' else curr_row['close'] - slippage
-
-        # sizing 기준: cash → equity 로 통일
+        # ✅ sizing 기준: equity로 통일
+        self._sync_equity(current_prices)
         current_equity = float(getattr(self.executor, "equity", self.executor.cash))
 
-        amount = self.risk_ctrl.calculate_entry_size(sym, entry_price, current_equity, sl, signal)
+        amount = self.risk_ctrl.calculate_entry_size(sym, entry_price, current_equity, sl, sig)
 
         if amount > 0:
             notional_value = amount * entry_price
@@ -534,90 +613,223 @@ class BacktestEngine:
             if self.executor.cash >= margin_required + fee:
                 self.executor.cash -= (margin_required + fee)
                 self.executor.positions[sym] = {
-                    'side': signal,
-                    'amount': amount,
-                    'entry_price': entry_price,
-                    'leverage': leverage,
-                    'margin': margin_required,
-                    'sl': sl,
-                    'tp1': tp,
+                    'side': sig,
+                    'amount': float(amount),
+                    'entry_price': float(entry_price),
+                    'leverage': float(leverage),
+                    'margin': float(margin_required),
+                    'sl': float(sl) if sl is not None else None,
                     'next_sl': None,
-                    'tp1_hit': False,
-                    'entry_time': curr_row.name,
-                    # ✅ (B) 1m exit 체크 시작점
-                    'last_1m_check': curr_row.name
+                    'trail_sl': None,
+                    'entry_time': curr_row.name
+                    
                 }
-                self._log_csv(curr_row.name, sym, signal, 'ENTRY', entry_price, amount, 0, self.executor.equity, 'Signal Entry')
 
-    def _process_existing_position(self, sym, curr_row, new_signal):
-        # 15m 모니터링(기존대로)
-        if sym not in self.executor.positions:
-            return
+                # ✅ ENTRY 직후에도 전체 가격으로 MTM 재평가
+                prices2 = dict(current_prices)
+                prices2[sym] = float(entry_price)
+                self._sync_equity(prices2)
 
+                self._log_csv(curr_row.name, sym, sig, 'ENTRY', entry_price, amount, 0.0, 'Signal Entry')
+
+    def _process_existing_position(self, sym, curr_row, new_signal, apply_mode: str = "next"):
         pos = self.executor.positions[sym]
+
+        # -----------------------------
+        # 0) normalize mode
+        # -----------------------------
+        try:
+            mode = str(apply_mode or "next").strip().lower()
+        except Exception:
+            mode = "next"
+        if mode not in ("next", "same"):
+            mode = "next"
+
+        # -----------------------------
+        # 1) config 기반 SL 전략/파라미터
+        # -----------------------------
+        sl_strategy = self._get_sl_strategy()
+        sl_params = self._get_sl_params()
+
+        # -----------------------------
+        # 2) ARMOR용 히스토리 DF (현재 시점 포함)
+        # -----------------------------
+        hist_df = None
+        try:
+            df_full = self.data_map.get(sym, None)
+            if isinstance(df_full, pd.DataFrame) and not df_full.empty:
+                hist_df = df_full.loc[:curr_row.name]
+                # 컬럼명 표준화(소문자)
+                try:
+                    rename_map = {}
+                    for c in hist_df.columns:
+                        lc = str(c).lower()
+                        if lc in ("open", "high", "low", "close", "volume"):
+                            rename_map[c] = lc
+                    if rename_map:
+                        hist_df = hist_df.rename(columns=rename_map)
+                except Exception:
+                    pass
+
+                # lookback 제한
+                try:
+                    lb = int(sl_params.get("armor_lookback", 300))
+                    if lb > 0 and len(hist_df) > lb:
+                        hist_df = hist_df.tail(lb)
+                except Exception:
+                    pass
+        except Exception:
+            hist_df = None
+
+        # -----------------------------
+        # 3) market_data 구성 (NaN/inf 안전)
+        # -----------------------------
+        def _safe_float(x, default=0.0):
+            try:
+                v = float(x)
+                if not math.isfinite(v):
+                    return float(default)
+                return v
+            except Exception:
+                return float(default)
+
+        close = _safe_float(curr_row.get("close", 0.0), 0.0)
+        high = _safe_float(curr_row.get("high", close), close)
+        low  = _safe_float(curr_row.get("low", close), close)
+
+        atr = curr_row.get("atr", None)
+        atr = _safe_float(atr, close * 0.01)
+        if atr <= 0:
+            atr = close * 0.01
+
+        st_val = curr_row.get("st_val", None)
+        try:
+            st_val = float(st_val) if st_val is not None else None
+            if (st_val is not None) and (not math.isfinite(st_val)):
+                st_val = None
+        except Exception:
+            st_val = None
+
+        adx = curr_row.get("adx", 0.0)
+        adx = _safe_float(adx, 0.0)
+
         market_data = {
-            'close': curr_row['close'],
-            'high': curr_row['high'],
-            'low': curr_row['low'],
-            'atr': curr_row.get('atr', curr_row['close'] * 0.01),
-            'st_val': curr_row.get('st_val', 0)
+            "close": close,
+            "high": high,
+            "low": low,
+            "atr": atr,
+            "st_val": st_val,
+            "adx": adx,
+            "df": hist_df,
         }
 
-        action, exec_price, reason, new_sl = self.monitor.check_conditions(sym, pos, market_data)
+        # -----------------------------
+        # 4) PositionMonitor 호출
+        # -----------------------------
+        action, exec_price, reason, new_sl = self.monitor.check_conditions(
+            sym,
+            pos,
+            market_data,
+            sl_apply_mode=mode,
+            sl_strategy=sl_strategy,
+            sl_params=sl_params,
+        )
 
-        # SL 갱신은 다음 캔들에만
-        if action == 'UPDATE_SL':
+        # -----------------------------
+        # 5) SL 갱신 + trail_sl 저장/갱신 (핵심 수정)
+        # -----------------------------
+        if action == "UPDATE_SL":
             try:
-                if new_sl is not None and float(new_sl) != float(pos.get('sl', 0)):
-                    pos['next_sl'] = float(new_sl)
+                if new_sl is not None:
+                    new_sl_f = float(new_sl)
+                    if (not math.isfinite(new_sl_f)) or (new_sl_f <= 0):
+                        new_sl_f = None
+
+                    if new_sl_f is not None:
+                        # 기존 SL
+                        cur_sl_raw = pos.get("sl", None)
+                        try:
+                            cur_sl_f = float(cur_sl_raw) if cur_sl_raw is not None else None
+                            if cur_sl_f is not None and (not math.isfinite(cur_sl_f)):
+                                cur_sl_f = None
+                        except Exception:
+                            cur_sl_f = None
+
+                        # 기존 trail_sl
+                        trail_raw = pos.get("trail_sl", None)
+                        try:
+                            trail_f = float(trail_raw) if trail_raw is not None else None
+                            if trail_f is not None and (not math.isfinite(trail_f)):
+                                trail_f = None
+                        except Exception:
+                            trail_f = None
+
+                        # 5-1) mode별 SL 반영(기존 정책 유지)
+                        if mode == "next":
+                            # next: next_sl에 저장
+                            if (cur_sl_f is None) or (new_sl_f != cur_sl_f):
+                                pos["next_sl"] = new_sl_f
+                        else:
+                            # same: 즉시 sl 반영 + next_sl 제거
+                            if (cur_sl_f is None) or (new_sl_f != cur_sl_f):
+                                pos["sl"] = new_sl_f
+                            if "next_sl" in pos:
+                                pos.pop("next_sl", None)
+
+                        # 5-2) trail_sl 저장/갱신 규칙
+                        # - "전략이 계산한 신규 SL(new_sl_f)" 자체를 trail_sl로 기록 (관측/디버그/정합성)
+                        # - tighten 방향만 반영 (LONG: 증가, SHORT: 감소)
+                        side = str(pos.get("side", "")).upper().strip()
+                        if side == "LONG":
+                            if (trail_f is None) or (new_sl_f > trail_f):
+                                pos["trail_sl"] = float(new_sl_f)
+                        elif side == "SHORT":
+                            if (trail_f is None) or (new_sl_f < trail_f):
+                                pos["trail_sl"] = float(new_sl_f)
+                        else:
+                            # side 이상 시에도 기록은 하되 덮어쓰기 최소화
+                            if trail_f is None:
+                                pos["trail_sl"] = float(new_sl_f)
+
             except Exception:
                 pass
 
-        if action == 'TP1':
-            close_amt = pos['amount'] * 0.5
-            pnl = (exec_price - pos['entry_price']) * close_amt if pos['side'] == 'LONG' else (pos['entry_price'] - exec_price) * close_amt
-            fee = exec_price * close_amt * BASE_FEE
-
-            margin_release = pos['margin'] * 0.5
-            pos['margin'] -= margin_release
-
-            self.executor.cash += margin_release + pnl - fee
-            pos['amount'] -= close_amt
-            pos['tp1_hit'] = True
-
-            self.executor.history.append({
-                'dt': curr_row.name, 'sym': sym, 'type': 'TP1',
-                'pnl': pnl - fee, 'reason': reason
-            })
-
-        elif action == 'EXIT':
+        elif action == "EXIT":
             self._execute_exit(sym, pos, exec_price, reason, curr_row.name)
             return
 
-        if new_signal and new_signal != pos['side']:
-            atr = market_data['atr']
+        # -----------------------------
+        # 6) new_signal flip (기존 유지)
+        # -----------------------------
+        if new_signal:
+            ns = str(new_signal).strip().upper()
+            alias = {
+                "BUY": "LONG", "LONG": "LONG", "BULL": "LONG",
+                "SELL": "SHORT", "SHORT": "SHORT", "BEAR": "SHORT",
+            }
+            ns = alias.get(ns, ns)
+        else:
+            ns = None
+
+        if ns and ns != str(pos.get("side", "")).upper():
             slippage = atr * 0.01
-            base = curr_row['close']
-            flip_price = base - slippage if pos['side'] == 'LONG' else base + slippage
-            self._execute_exit(sym, pos, flip_price, 'SIGNAL_FLIP', curr_row.name)
+            base = close
+            flip_price = base - slippage if pos.get("side", "").upper() == "LONG" else base + slippage
+            self._execute_exit(sym, pos, flip_price, "SIGNAL_FLIP", curr_row.name)
 
     def _execute_exit(self, sym, pos, price, reason, dt):
-        # 포지션이 이미 지워졌을 수도 있음(1m exit 이후 15m 루프에서 다시 들어올 수 있으니 방어)
-        if sym not in self.executor.positions:
-            return
-
-        amount = pos['amount']
+        amount = float(pos['amount'])
         pnl = (price - pos['entry_price']) * amount if pos['side'] == 'LONG' else (pos['entry_price'] - price) * amount
 
         exit_value = price * amount
         fee = exit_value * BASE_FEE
 
-        margin_locked = pos['margin']
+        margin_locked = float(pos.get('margin', 0.0))
         self.executor.cash += margin_locked + pnl - fee
 
         net_pnl = pnl - fee
 
-        # 동일 캔들 재진입 금지: 최소 1캔들 쿨다운
+        # ✅ 동일 캔들 재진입 금지: 최소 1캔들 쿨다운
         min_next = dt + self.bar_td
 
         if net_pnl > 0:
@@ -639,19 +851,17 @@ class BacktestEngine:
             cd = dt + pd.Timedelta(hours=wait_hours)
             self.cooldowns[sym] = max(cd, min_next)
 
-        # equity는 루프에서 MTM으로 갱신되지만, 로그 시점 일관성 위해 최소 반영
+        # ✅ EXIT 직후에도 전체 가격으로 MTM 재평가
+        prices2 = dict(self.last_prices) if self.last_prices else {}
+        prices2[sym] = float(price)
+        self._sync_equity(prices2)
+
+        self._log_csv(dt, sym, pos['side'], 'EXIT', price, amount, net_pnl, reason)
         try:
-            self.executor.equity = float(self.executor.cash)
+            pos.pop("trail_sl", None)
         except Exception:
             pass
-
-        self._log_csv(dt, sym, pos['side'], 'EXIT', price, amount, net_pnl, self.executor.equity, reason)
-
-        try:
-            del self.executor.positions[sym]
-        except Exception:
-            pass
-
+        del self.executor.positions[sym]
         self.executor.history.append({'dt': dt, 'sym': sym, 'type': 'EXIT', 'pnl': net_pnl, 'reason': reason})
 
 

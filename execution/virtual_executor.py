@@ -34,7 +34,7 @@ class VirtualExecutor:
         self.positions = {}
         self.history = []   # 인메모리 로그 (콘솔 리포트용)
         self.equity_curve = []
-        self.MAX_POSITIONS = 5
+        self.MAX_POSITIONS = 20
 
         # [DATA DRIVEN] HistoryManager 초기화
         csv_path = os.path.join(root_dir, "backtest_history.csv")
@@ -165,7 +165,7 @@ class VirtualExecutor:
                 targets.append((s, vol))
 
         targets.sort(key=lambda x: x[1], reverse=True)
-        return [t[0] for t in targets][:20]  # <-- 항상 list
+        return [t[0] for t in targets][:100]  # <-- 항상 list
 
     def prepare_data(self, symbols, days=30):
         # (기존 데이터 다운로드 로직 유지)

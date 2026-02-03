@@ -1,0 +1,36 @@
+# =========================================================
+# Step 02 - Build Symbol×Window Metrics & UF Dataset
+# ---------------------------------------------------------
+# Generated: 2026-02-03T13:29:24Z
+#
+# HARD RULES (v1.0):
+# - Strategy logic (entry/positioning/exit) MUST NOT be modified.
+# - UF MUST output ONLY universe.json for engine consumption.
+# - All files MUST live under universe_filter/.
+# - Pipeline is step-by-step; each step is a single runnable module.
+# - Only Step 05 writes output/universe.json.
+# =========================================================
+
+"""
+Role
+----
+Builds windowed metrics (7/30/90) and creates uf_dataset for modeling; enforces feature caps and corr-cut.
+
+Inputs
+------
+- universe_filter/output/cache/trades.parquet
+- universe_filter/config/uf_config.json
+- (optional) universe_filter/input/ohlcv/*
+
+Outputs
+-------
+- universe_filter/output/cache/symbol_window_metrics.parquet
+- universe_filter/output/cache/uf_dataset.parquet
+- (report additions) universe_filter/output/run_report.json
+
+Notes
+-----
+- Feature count <= 20; outcome-based features <= 3.
+- If OHLCV missing, OHLCV-based features are skipped WITHOUT failing pipeline.
+- Apply |corr| > 0.80 cut (drop one of pair).
+"""

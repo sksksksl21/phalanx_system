@@ -1,0 +1,32 @@
+# =========================================================
+# Step 05 - Export universe.json (Single Writer)
+# ---------------------------------------------------------
+# Generated: 2026-02-03T13:29:24Z
+#
+# HARD RULES (v1.0):
+# - Strategy logic (entry/positioning/exit) MUST NOT be modified.
+# - UF MUST output ONLY universe.json for engine consumption.
+# - All files MUST live under universe_filter/.
+# - Pipeline is step-by-step; each step is a single runnable module.
+# - Only Step 05 writes output/universe.json.
+# =========================================================
+
+"""
+Role
+----
+Writes output/universe.json in the fixed schema using selected_symbols.json; this is the ONLY writer.
+
+Inputs
+------
+- universe_filter/output/cache/selected_symbols.json
+- universe_filter/config/uf_config.json
+
+Outputs
+-------
+- universe_filter/output/universe.json
+
+Notes
+-----
+- MUST be the single writer of universe.json.
+- Include meta: asof, rebalance_rule, windows_days, objective, n_selected, (optional) zombie_N.
+"""
