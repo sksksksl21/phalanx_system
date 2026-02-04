@@ -81,7 +81,7 @@ class TelegramNotifier:
         else:
             self.enabled = bool(self.token and self.chat_id)
 
-        self.send_update_sl = bool(ss.get("telegram_send_update_sl", False))
+        self.send_update_sl = bool(ss.get("telegram_send_update_sl", True))
         self.send_heartbeat = bool(ss.get("telegram_send_heartbeat", False))
         self.tag = str(ss.get("telegram_tag", "PHALANX"))
 
@@ -350,9 +350,13 @@ class LiveEngine:
         """
         ✅ 실계좌(바이낸스) 권위화는 하되,
         - side/amount/entry_price/margin 만 바이낸스를 권위로 갱신
-        - sl/tp1/next_sl/tp1_hit/entry_time 등 '관리필드'는 로컬을 유지
+        - sl/next_sl/trail_sl/entry_time 등 '관리필드'는 로컬을 유지
         - 로컬에 없고 실계좌에만 있으면: 로컬 포지션을 생성(관리필드 빈칸 가능)
         - 실계좌에 없고 로컬에만 있으면: 로컬 포지션 제거 (유령 포지션 제거)
+
+        ⚠️ [핵심 수정]
+        - ARMOR의 stateful 필드인 position["trail_sl"]을 MGMT_KEYS에 포함시켜
+        reconcile 과정에서 날아가지 않도록 영속성 보장
         """
         if not hasattr(self.executor, "fetch_positions"):
             self.freeze_new_entries = False
@@ -367,15 +371,19 @@ class LiveEngine:
         local = self.executor.positions or {}
 
         # ---- helper: 관리필드 목록(로컬에서 유지할 것들)
+        # ✅ trail_sl 추가 (ARMOR stateful)
         MGMT_KEYS = {
-            "sl", "next_sl", "entry_time",
-            # 필요하면 여기에 추가 가능
+            "sl",
+            "next_sl",
+            "trail_sl",     # ✅ NEW: Armor L2 VolTrail state
+            "entry_time",
+            # 필요하면 여기에 추가 가능 (tp1, tp1_hit 등)
         }
 
-        # ---- 1) 실계좌에 있는 포지션을 로컬에 merge (바이낸스 권위 필드만 덮음)
         merged = {}
 
-        for sym, rp in real.items():
+        # ---- 1) 실계좌에 있는 포지션을 로컬에 merge (바이낸스 권위 필드만 덮음)
+        for sym, rp in (real or {}).items():
             lp = local.get(sym, {}) if isinstance(local.get(sym, {}), dict) else {}
 
             # 로컬 관리필드 유지
@@ -386,7 +394,8 @@ class LiveEngine:
             try:
                 mp["side"] = str(rp.get("side", "")).upper()
             except Exception:
-                mp["side"] = lp.get("side", "")
+                mp["side"] = str(lp.get("side", "")).upper()
+
             try:
                 mp["amount"] = float(rp.get("amount", 0) or 0)
             except Exception:
@@ -398,20 +407,18 @@ class LiveEngine:
                     mp["entry_price"] = float(rp.get("entry_price"))
                 except Exception:
                     pass
-            else:
-                if lp.get("entry_price") is not None:
-                    mp["entry_price"] = lp.get("entry_price")
+            elif lp.get("entry_price") is not None:
+                mp["entry_price"] = lp.get("entry_price")
 
             if rp.get("margin") is not None:
                 try:
                     mp["margin"] = float(rp.get("margin"))
                 except Exception:
                     pass
-            else:
-                if lp.get("margin") is not None:
-                    mp["margin"] = lp.get("margin")
+            elif lp.get("margin") is not None:
+                mp["margin"] = lp.get("margin")
 
-            # merge
+            # merge 관리필드
             mp.update(keep_mgmt)
 
             # entry_time이 없으면 보정(재시작/리컨실로 새로 붙는 포지션)
@@ -427,21 +434,22 @@ class LiveEngine:
         mismatch = False
         reasons = []
 
-        def _u(x): 
+        def _u(x):
             return str(x or "").upper()
 
-        # real vs merged(=반영후 로컬) 비교는 의미 없고,
-        # real vs local(기존) 불일치가 있었는지 기록만 남긴다.
-        for sym, rp in real.items():
+        for sym, rp in (real or {}).items():
             if sym not in local:
                 mismatch = True
                 reasons.append(f"real_has_local_missing:{sym}")
                 continue
+
             lp = local.get(sym, {}) or {}
+
             if _u(rp.get("side")) != _u(lp.get("side")):
                 mismatch = True
                 reasons.append(f"side_mismatch:{sym}")
                 continue
+
             try:
                 ra = float(rp.get("amount", 0) or 0)
                 la = float(lp.get("amount", 0) or 0)
@@ -454,7 +462,7 @@ class LiveEngine:
                 reasons.append(f"amount_parse_fail:{sym}")
 
         for sym in (local or {}).keys():
-            if sym not in real:
+            if sym not in (real or {}):
                 mismatch = True
                 reasons.append(f"local_has_real_missing:{sym}")
                 break
@@ -467,12 +475,8 @@ class LiveEngine:
 
         if mismatch:
             # mismatch가 있었더라도 이제 merged로 정합성 맞췄으니
-            # "신규진입 freeze"는 운영 철학에 따라 선택인데,
-            # 너는 자동관리 최우선이라 freeze는 최소화가 맞다.
-            # -> 여기서는 진입 freeze를 걸지 않고, 대신 로그/텔레그램만 남긴다.
+            # 진입 freeze 최소화(운영 철학) -> 로그/텔레그램만 남김
             self._clear_entry_freeze("reconcile_mismatch_merged")
-           
-
 
             msg = " | ".join(reasons)[:800]
             logger.warning("⚠️ RECONCILE_MISMATCH detected but merged -> keep managing existing positions")
@@ -1207,6 +1211,9 @@ class LiveEngine:
         ✅ LIVE에서도 Backtest와 동일한 PositionMonitor 입력을 제공:
         - market_data: close/high/low/atr/st_val/adx + df(hist_df)
         - sl_strategy: armor 포함
+
+        ✅ 추가: UPDATE_SL 발생 시 텔레그램 전송(옵션)
+        - system_settings.telegram_send_update_sl = True 일 때만 전송
         """
         pos = self.executor.positions.get(sym)
         if not pos:
@@ -1252,19 +1259,14 @@ class LiveEngine:
         sl_params = self._get_sl_params()
 
         # -------------------------------------------------
-        # ✅ hist_df 구성 (Backtest와 동일한 목적: armor/컨텍스트 전략 입력)
-        # - self.data_map[sym]에서 현재 시점까지 slice
-        # - 컬럼명 표준화(open/high/low/close/volume)
-        # - sl_params["armor_lookback"] 있으면 제한 (기본 300)
+        # ✅ hist_df 구성
         # -------------------------------------------------
         hist_df = None
         try:
             df_full = self.data_map.get(sym)
             if isinstance(df_full, pd.DataFrame) and (not df_full.empty):
-                # 현재 시점까지 포함
                 hist_df = df_full.loc[:curr_row.name].copy()
 
-                # 컬럼명 표준화(소문자)
                 try:
                     rename_map = {}
                     for c in hist_df.columns:
@@ -1276,7 +1278,6 @@ class LiveEngine:
                 except Exception:
                     pass
 
-                # lookback 제한
                 try:
                     lb = int(sl_params.get("armor_lookback", 300))
                     if lb > 0 and len(hist_df) > lb:
@@ -1287,7 +1288,7 @@ class LiveEngine:
             hist_df = None
 
         # -------------------------------------------------
-        # ✅ market_data 안전 변환 (NaN/inf/0 방어)
+        # ✅ market_data 안전 변환
         # -------------------------------------------------
         def _safe_float(x, default=0.0):
             try:
@@ -1343,6 +1344,10 @@ class LiveEngine:
         # ✅ UPDATE_SL
         # -------------------------------------------------
         if action == "UPDATE_SL":
+            applied_kind = "NONE"   # "NEXT" or "SAME" or "NONE"
+            old_sl = pos.get("sl", None)
+            old_next = pos.get("next_sl", None)
+
             try:
                 if new_sl is not None:
                     new_sl_f = float(new_sl)
@@ -1357,19 +1362,201 @@ class LiveEngine:
                     if apply_mode == "next":
                         if (cur_f is None or new_sl_f != cur_f) and (nxt_f is None or new_sl_f != nxt_f):
                             pos["next_sl"] = new_sl_f
+                            applied_kind = "NEXT"
                             self._save_state()
                     else:
                         if (cur_f is None) or (new_sl_f != cur_f):
                             pos["sl"] = new_sl_f
                             pos["next_sl"] = None
+                            applied_kind = "SAME"
                             self._save_state()
             except Exception:
                 pass
+
+            # ✅ Telegram UPDATE_SL (옵션)
+            # - notifier.send_update_sl 가 True 일 때만 전송
+            if getattr(self.notifier, "send_update_sl", False) and applied_kind != "NONE":
+                try:
+                    side = str(pos.get("side", "")).upper()
+                    entry_px = pos.get("entry_price", None)
+                    amt = pos.get("amount", None)
+
+                    # 적용 후 값
+                    cur_sl = pos.get("sl", None)
+                    nxt_sl = pos.get("next_sl", None)
+
+                    self.notifier.send(
+                        title="UPDATE_SL",
+                        lines=[
+                            f"t={candle_t}",
+                            f"symbol={sym}",
+                            f"side={side}",
+                            f"apply_mode={apply_mode}",
+                            f"sl_strategy={sl_strategy}",
+                            f"reason={reason}",
+                            f"price_close={close}",
+                            f"entry_price={entry_px}",
+                            f"amount={amt}",
+                            f"old_sl={old_sl}",
+                            f"old_next_sl={old_next}",
+                            f"new_sl={new_sl}",
+                            f"cur_sl={cur_sl}",
+                            f"next_sl={nxt_sl}",
+                            f"{self._freeze_meta()}",
+                        ],
+                    )
+                except Exception:
+                    pass
 
             return "UPDATE_SL"
 
         if action != "EXIT":
             return "HOLD"
+
+        # -------------------------------------------------
+        # ✅ EXIT (이하 기존 로직 그대로)
+        # -------------------------------------------------
+        is_open_pre, _rp_pre = self._verify_position_state(sym)
+        if is_open_pre is False:
+            logger.warning(f"🟠 MANUAL_EXIT_DETECTED | {sym} -> local pop + clear freeze")
+
+            self.executor.positions.pop(sym, None)
+            self._save_state()
+            self._clear_entry_freeze("manual_exit_detected")
+
+            try:
+                self._append_history({
+                    "dt": str(candle_t),
+                    "event": "EXIT",
+                    "mode": "LIVE",
+                    "symbol": sym,
+                    "side": str(pos.get("side", "")).upper(),
+                    "price": None,
+                    "amount": float(pos.get("amount", 0)),
+                    "margin": float(pos.get("margin", 0) or 0),
+                    "pnl": None,
+                    "roe_pct": None,
+                    "sl": float(pos.get("sl", 0)) if pos.get("sl") is not None else None,
+                    "reason": "MANUAL_EXIT_DETECTED",
+                    "pos_count": int(len(self.executor.positions or {})),
+                })
+            except Exception:
+                pass
+
+            try:
+                self.notifier.send(
+                    title="EXIT",
+                    lines=[
+                        f"t={candle_t}",
+                        f"symbol={sym}",
+                        f"side={str(pos.get('side','')).upper()}",
+                        "exec_price=None",
+                        f"amount={float(pos.get('amount',0))}",
+                        "pnl_est=None",
+                        "roe_est_pct=None",
+                        f"sl={pos.get('sl', None)}",
+                        "reason=MANUAL_EXIT_DETECTED",
+                        "close_call_ok=0",
+                        "closed_ok=1",
+                        f"{self._freeze_meta()}",
+                    ],
+                )
+            except Exception:
+                pass
+
+            return "EXIT"
+
+        # ---- 기존 EXIT 로직 계속 ----
+        logger.info(f"🔴 EXIT | {sym} px={exec_price} reason={reason}")
+
+        ok_close = False
+        try:
+            ok_close = bool(self.executor.close_position(sym, exec_price, reason))
+        except Exception:
+            ok_close = False
+
+        is_open, _rp = self._verify_position_state(sym)
+
+        if is_open is None:
+            logger.critical(f"🚨 EXIT_VERIFY_FETCH_FAIL -> ENTRY FREEZE | {sym}")
+            self._set_entry_freeze("exit_verify_fetch_fail")
+            self.reconcile_positions()
+            closed_ok = 0
+        elif is_open is True:
+            logger.critical(f"🚨 EXIT_VERIFY_FAIL (still open) -> ENTRY FREEZE | {sym}")
+            self._set_entry_freeze("exit_verify_still_open")
+            self.reconcile_positions()
+            closed_ok = 0
+        else:
+            closed_ok = 1
+            self._clear_entry_freeze("exit_verify_ok")
+
+        pnl = None
+        roe = None
+        fee = None
+        margin = float(pos.get("margin", 0) or 0)
+        try:
+            px = float(exec_price)
+            entry = float(pos.get("entry_price", 0))
+            amt = float(pos.get("amount", 0))
+            side = str(pos.get("side", "")).upper()
+            pnl = (px - entry) * amt if side == "LONG" else (entry - px) * amt
+            fee = px * amt * BASE_FEE
+            if margin > 0:
+                roe = (float(pnl) / float(margin)) * 100.0
+        except Exception:
+            pass
+
+        try:
+            self._append_history({
+                "dt": str(candle_t),
+                "event": "EXIT",
+                "mode": "LIVE",
+                "symbol": sym,
+                "side": str(pos.get("side", "")).upper(),
+                "price": float(exec_price) if exec_price is not None else None,
+                "amount": float(pos.get("amount", 0)),
+                "fee": float(fee) if fee is not None else None,
+                "margin": float(margin),
+                "pnl": float(pnl) if pnl is not None else None,
+                "roe_pct": float(roe) if roe is not None else None,
+                "sl": float(pos.get("sl", 0)) if pos.get("sl") is not None else None,
+                "reason": f"{reason} | close_call={int(ok_close)} | closed_ok={int(closed_ok)} | strat={sl_strategy}",
+                "pos_count": int(max(len(self.executor.positions or {}) - (1 if closed_ok else 0), 0)),
+            })
+        except Exception:
+            pass
+
+        try:
+            self.notifier.send(
+                title="EXIT",
+                lines=[
+                    f"t={candle_t}",
+                    f"symbol={sym}",
+                    f"side={str(pos.get('side','')).upper()}",
+                    f"exec_price={exec_price}",
+                    f"amount={float(pos.get('amount',0))}",
+                    f"pnl_est={pnl}",
+                    f"roe_est_pct={roe}",
+                    f"sl={pos.get('sl', None)}",
+                    f"reason={reason}",
+                    f"close_call_ok={int(ok_close)}",
+                    f"closed_ok={int(closed_ok)}",
+                    f"{self._freeze_meta()}",
+                    f"apply_mode={apply_mode}",
+                    f"sl_strategy={sl_strategy}",
+                ],
+            )
+        except Exception:
+            pass
+
+        if closed_ok == 1:
+            self.executor.positions.pop(sym, None)
+            self._save_state()
+            return "EXIT"
+
+        return "HOLD"
+
 
         # -------------------------------------------------
         # ✅ EXIT (이하 기존 로직 그대로)

@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pandas_ta as ta
 
@@ -25,7 +26,7 @@ class TitanStrategy:
         # =====================================================================
         # [Versioning]
         # =====================================================================
-        self.__version__ = "8.1.0-LiquidityMSSPullback"
+        self.__version__ = "8.2.0-LiquidityMSSPullback-IntegrityFix"
 
         # =====================================================================
         # [Hyperopt 대상 파라미터]
@@ -39,15 +40,19 @@ class TitanStrategy:
             "rsi_lower": 28,      # (옵션) 필터로만 사용
             "vol_factor": 0.9,
             "ema_intraday": 200,
+
             # --- 일봉(Daily) 설정 ---
             "daily_ema": 5,
 
             # --- Market Structure / Liquidity 설정 ---
-            "swing_len": 3,               # pivot 길이 (프랙탈)
-            "context_lookback": 120,      # 최근 N봉에서 스윕/구조 이벤트 추적
+            "swing_len": 3,               # pivot 길이(프랙탈)
+            "context_lookback": 120,      # MSS 유효기간/스윕 컨텍스트
             "retest_tolerance_atr": 0.25, # retest 레벨 허용오차(ATR 비율)
             "use_daily_filter": True,     # 일봉 EMA 필터 사용 여부
             "use_vol_filter": True,       # 거래량 필터 사용 여부
+
+            # --- Safety (정합성/운영 안정) ---
+            "use_st_dir_filter": True,    # 진입 방향과 ST 방향 불일치 시 신호 차단
         }
 
     def get_blacklist(self):
@@ -91,6 +96,12 @@ class TitanStrategy:
         return adx_df[adx_df.columns[0]]
 
     def _safe_pick_supertrend(self, st_df: pd.DataFrame):
+        """
+        pandas_ta.supertrend는 컬럼명이 버전에 따라 달라질 수 있어 방어적으로 pick한다.
+        반환:
+          - st_val: SuperTrend 값(선)
+          - st_dir: 방향(+1 up, -1 down) 계열(없으면 None)
+        """
         if st_df is None or not isinstance(st_df, pd.DataFrame) or st_df.empty:
             return None, None
 
@@ -164,31 +175,44 @@ class TitanStrategy:
     # =========================================================
     # Market Structure Helpers (Pure, no I/O)
     # =========================================================
-    def _compute_pivots(self, df: pd.DataFrame, swing_len: int):
+    def _compute_pivots_confirmed(self, df: pd.DataFrame, swing_len: int):
         """
-        프랙탈 피봇(high/low) 계산.
-        - pivot_high: 해당 봉의 high가 좌우 swing_len 범위에서 최댓값이면 1
-        - pivot_low : 해당 봉의 low 가 좌우 swing_len 범위에서 최솟값이면 1
-        주의: 중앙봉 기준이라 오른쪽 미래 데이터가 필요 -> 실전/백테 공통으로
-             "지표 계산 단계"에서만 만들고, 엔진이 캔들을 흘릴 때는
-             이미 과거 봉의 pivot이 확정된 것으로 동작(실시간에서는 swing_len 지연 생김).
+        ✅ Non-lookahead / Non-repainting(확정 지연 강제) 프랙탈 피봇 계산
+
+        정의:
+          - pivot_high_confirmed[t] = 1  <=>  (t - n)봉의 high가 [t-2n .. t] 구간에서 최댓값
+          - pivot_low_confirmed[t]  = 1  <=>  (t - n)봉의 low 가 [t-2n .. t] 구간에서 최솟값
+
+        즉, 피봇은 실제 발생 시점보다 n봉 뒤에 확정된다(실전/백테 동일).
         """
         n = int(max(1, swing_len))
         w = 2 * n + 1
 
-        # rolling center는 미래를 쓰는 "정의"지만, pivot은 원래 확정이 지연되는 개념이라
-        # 이 형태가 오히려 현실적(확정까지 지연)이다.
-        rh = df["high"].rolling(window=w, center=True).max()
-        rl = df["low"].rolling(window=w, center=True).min()
+        roll_high = df["high"].rolling(window=w, min_periods=w).max()
+        roll_low = df["low"].rolling(window=w, min_periods=w).min()
 
-        pivot_high = (df["high"] == rh).astype("int")
-        pivot_low = (df["low"] == rl).astype("int")
+        pivot_high_conf = (df["high"].shift(n) == roll_high).astype("int")
+        pivot_low_conf = (df["low"].shift(n) == roll_low).astype("int")
 
-        # 가장자리 NaN은 0 처리
-        pivot_high = pivot_high.fillna(0).astype("int")
-        pivot_low = pivot_low.fillna(0).astype("int")
+        pivot_high_conf = pivot_high_conf.fillna(0).astype("int")
+        pivot_low_conf = pivot_low_conf.fillna(0).astype("int")
 
-        return pivot_high, pivot_low
+        return pivot_high_conf, pivot_low_conf
+
+    @staticmethod
+    def _age_from_triggers(trigger: pd.Series) -> pd.Series:
+        """
+        trigger(0/1)로부터 최근 트리거 이후 경과 봉 수(age)를 만든다.
+        - 트리거가 한 번도 없으면 age=NaN
+        - 트리거 봉에서 age=0, 이후 +1
+        """
+        t = trigger.fillna(0).astype(int).to_numpy()
+        idx = np.arange(len(t), dtype=float)
+        last = np.where(t == 1, idx, np.nan)
+        last = pd.Series(last, index=trigger.index).ffill()
+        age = pd.Series(np.arange(len(t), dtype=float), index=trigger.index) - last
+        age = age.where(last.notna(), np.nan)
+        return age
 
     def calculate_indicators(self, symbol, df):
         """
@@ -196,8 +220,10 @@ class TitanStrategy:
         - 15분봉 지표 + 일봉(리샘플) EMA 필터
         - Lookahead Bias 방지: daily_df.shift(1)
 
-        추가:
-        - Liquidity Sweep + MSS + Retest(Pullback) 구조형 진입 지표
+        구조:
+        - Rejection Sweep(유지) -> MSS(레벨 스냅샷) -> Retest(Pullback)
+        - Pivot: 확정 지연 강제(Non-lookahead)
+        - MSS: 레벨 스냅샷 고정 + 유효기간(age) 적용
         """
         df = self._ensure_datetime_index(df)
         df = df.copy()
@@ -207,7 +233,7 @@ class TitanStrategy:
         # 1. Intraday Indicators (15분봉 기준)
         # =========================================================
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=p["atr_period"])
-        df["vol_ma"] = df["volume"].rolling(window=20).mean()
+        df["vol_ma"] = df["volume"].rolling(window=20, min_periods=1).mean()
         df["ema_intra"] = ta.ema(df["close"], length=p["ema_intraday"])
         df["rsi"] = ta.rsi(df["close"], length=14)
 
@@ -218,8 +244,9 @@ class TitanStrategy:
         st = ta.supertrend(df["high"], df["low"], df["close"], length=12, multiplier=3.0)
         st_val_ser, st_dir_ser = self._safe_pick_supertrend(st)
 
-        df["st_val"] = st_val_ser if st_val_ser is not None else 0.0
+        df["st_val"] = st_val_ser if st_val_ser is not None else np.nan
         if st_dir_ser is not None:
+            # 보통 +1 / -1
             df["st_dir"] = st_dir_ser.astype("float").round(0).astype("int")
         else:
             df["st_dir"] = 0
@@ -228,12 +255,11 @@ class TitanStrategy:
         # 2. Daily Indicators (일봉 재가공 및 병합)
         # =========================================================
         ema_daily_mapped, ok = self._safe_ema_daily_map(df, int(p.get("daily_ema", 25)))
-
         if not ok or ema_daily_mapped is None:
             df["ema_daily"] = 0.0
             df["ema_daily_ok"] = 0
         else:
-            df["ema_daily"] = pd.Series(ema_daily_mapped, index=df.index).fillna(0.0)
+            df["ema_daily"] = pd.Series(ema_daily_mapped, index=df.index).astype(float).fillna(0.0)
             df["ema_daily_ok"] = 1
 
         # =========================================================
@@ -243,74 +269,154 @@ class TitanStrategy:
         lookback = int(p.get("context_lookback", 120))
         tol_atr = float(p.get("retest_tolerance_atr", 0.25))
 
-        # 3-1) pivots
-        ph, pl = self._compute_pivots(df, swing_len=swing_len)
-        df["pivot_high"] = ph
-        df["pivot_low"] = pl
+        # 3-1) pivots (확정 지연 강제)
+        ph_c, pl_c = self._compute_pivots_confirmed(df, swing_len=swing_len)
+        df["pivot_high"] = ph_c
+        df["pivot_low"] = pl_c
 
-        # pivot price를 값으로 저장 후 ffill
-        df["pivot_high_price"] = df["high"].where(df["pivot_high"] == 1, other=pd.NA)
-        df["pivot_low_price"] = df["low"].where(df["pivot_low"] == 1, other=pd.NA)
+        # pivot price: float 유지(np.nan)
+        n = int(max(1, swing_len))
+        df["pivot_high_price"] = np.where(df["pivot_high"] == 1, df["high"].shift(n).astype(float), np.nan)
+        df["pivot_low_price"] = np.where(df["pivot_low"] == 1, df["low"].shift(n).astype(float), np.nan)
 
         # 최근 pivot 레벨을 계속 들고감
-        df["last_pivot_high"] = df["pivot_high_price"].ffill()
-        df["last_pivot_low"] = df["pivot_low_price"].ffill()
+        df["last_pivot_high"] = pd.Series(df["pivot_high_price"], index=df.index).ffill()
+        df["last_pivot_low"] = pd.Series(df["pivot_low_price"], index=df.index).ffill()
 
-        # 3-2) Liquidity sweep
-        # - high sweep: high가 last_pivot_high를 뚫고 종가가 다시 아래로
-        # - low sweep : low 가 last_pivot_low 를 깨고 종가가 다시 위로
-        lph = df["last_pivot_high"]
-        lpl = df["last_pivot_low"]
+        lph = df["last_pivot_high"].astype(float)
+        lpl = df["last_pivot_low"].astype(float)
 
-        # NaN 보호
+        # 3-2) Liquidity sweep (Rejection sweep ONLY: 채택한 철학)
         df["sweep_high"] = ((df["high"] > lph) & (df["close"] < lph) & lph.notna()).astype("int")
         df["sweep_low"] = ((df["low"] < lpl) & (df["close"] > lpl) & lpl.notna()).astype("int")
 
-        # 3-3) 최근 스윕 시점(윈도우 내)
-        # lookback 창에서 최근 1이 있는지 -> 더 강한 MSS 연결용
+        # 3-3) 최근 스윕 플래그(컨텍스트)
         df["recent_sweep_high"] = df["sweep_high"].rolling(lookback, min_periods=1).max().fillna(0).astype("int")
         df["recent_sweep_low"] = df["sweep_low"].rolling(lookback, min_periods=1).max().fillna(0).astype("int")
 
-        # 3-4) MSS (Market Structure Shift)
-        # bullish MSS: 최근 low sweep가 있었고, 종가가 last_pivot_high를 상향 돌파
-        # bearish MSS: 최근 high sweep가 있었고, 종가가 last_pivot_low 를 하향 돌파
-        df["mss_up"] = ((df["recent_sweep_low"] == 1) & (df["close"] > lph) & lph.notna()).astype("int")
-        df["mss_down"] = ((df["recent_sweep_high"] == 1) & (df["close"] < lpl) & lpl.notna()).astype("int")
+        # 3-4) MSS 트리거(발생 순간) + 레벨 스냅샷
+        # - bullish MSS: 최근 low sweep 컨텍스트 + 종가가 pivot_high 레벨 상향 돌파
+        # - bearish MSS: 최근 high sweep 컨텍스트 + 종가가 pivot_low 레벨 하향 돌파
+        mss_up_trigger = (
+            (df["recent_sweep_low"] == 1)
+            & lph.notna()
+            & (df["close"] > lph)
+            & (df["close"].shift(1) <= lph.shift(1).where(lph.shift(1).notna(), lph.shift(1)))
+        ).fillna(False).astype("int")
+
+        mss_down_trigger = (
+            (df["recent_sweep_high"] == 1)
+            & lpl.notna()
+            & (df["close"] < lpl)
+            & (df["close"].shift(1) >= lpl.shift(1).where(lpl.shift(1).notna(), lpl.shift(1)))
+        ).fillna(False).astype("int")
+
+        df["mss_up_trigger"] = mss_up_trigger
+        df["mss_down_trigger"] = mss_down_trigger
+
+        # MSS 레벨 스냅샷(트리거 순간의 기준 레벨)
+        df["mss_level_up_raw"] = np.where(df["mss_up_trigger"] == 1, lph.astype(float), np.nan)
+        df["mss_level_down_raw"] = np.where(df["mss_down_trigger"] == 1, lpl.astype(float), np.nan)
+
+        # MSS age(유효기간 관리)
+        df["mss_age_up"] = self._age_from_triggers(df["mss_up_trigger"])
+        df["mss_age_down"] = self._age_from_triggers(df["mss_down_trigger"])
+
+        df["mss_active_up"] = ((df["mss_age_up"].notna()) & (df["mss_age_up"] <= lookback)).astype("int")
+        df["mss_active_down"] = ((df["mss_age_down"].notna()) & (df["mss_age_down"] <= lookback)).astype("int")
 
         # 3-5) Retest (Pullback) 트리거
-        # MSS 돌파 레벨을 "가까이 되돌려 테스트" + 거부(rejection) 캔들
-        # - LONG: 돌파 레벨(lph) 근처까지 내려왔다가(허용오차), 종가가 다시 위로(양봉/회복)
-        # - SHORT: 돌파 레벨(lpl) 근처까지 올라갔다가, 종가가 다시 아래로
-        atr = df["atr"].fillna(0.0)
+        atr = df["atr"].astype(float).fillna(0.0)
         tol = atr * tol_atr
 
-        # 거부 캔들(간단 버전): close가 open보다 유리 방향 / wick 존재는 선택
-        # LONG rejection: 저점이 레벨 아래로 살짝 찍혀도 되고(close가 다시 위)
+        # MSS 이후 유지되는 레벨(리테스트까지 고정)
+        # 정책: "MSS 발생 -> 레벨 유지 -> retest 발생 시 리셋 -> 다음 MSS까지 대기"
+        # 이를 위해 (MSS 트리거 OR retest 발생) 때마다 세그먼트가 끊기게 만든다.
+        # (리테스트는 아래에서 계산하므로, 일단 raw ffill로 1차 후보 생성 후 retest 계산 -> 리셋 적용)
+        level_up_ffill = pd.Series(df["mss_level_up_raw"], index=df.index).ffill()
+        level_down_ffill = pd.Series(df["mss_level_down_raw"], index=df.index).ffill()
+
+        # 1차 리테스트 계산(리셋 적용 전)
+        # - LONG: MSS active + 레벨 근처로 내려왔다가(close>=level) 양봉 마감 (rejection)
+        # - SHORT: MSS active + 레벨 근처로 올라갔다가(close<=level) 음봉 마감 (rejection)
+        retest_long_raw = (
+            (df["mss_active_up"] == 1)
+            & pd.Series(level_up_ffill, index=df.index).notna()
+            & (df["low"] <= (level_up_ffill + tol))
+            & (df["close"] >= level_up_ffill)
+            & (df["close"] > df["open"])
+        ).fillna(False).astype("int")
+
+        retest_short_raw = (
+            (df["mss_active_down"] == 1)
+            & pd.Series(level_down_ffill, index=df.index).notna()
+            & (df["high"] >= (level_down_ffill - tol))
+            & (df["close"] <= level_down_ffill)
+            & (df["close"] < df["open"])
+        ).fillna(False).astype("int")
+
+        # 리셋 반영: retest가 한 번 발생하면 해당 레벨은 즉시 무효화(다음 MSS까지)
+        reset_up = (df["mss_up_trigger"] == 1) | (retest_long_raw == 1)
+        reset_down = (df["mss_down_trigger"] == 1) | (retest_short_raw == 1)
+
+        seg_up = reset_up.astype(int).cumsum()
+        seg_down = reset_down.astype(int).cumsum()
+
+        # 세그먼트 내에서 MSS 트리거 순간 레벨만 유지(ffill), retest 발생 세그먼트에서는 다음 구간으로 넘어가며 레벨이 끊김
+        df["mss_level_up"] = (
+            df["mss_level_up_raw"]
+            .groupby(seg_up)
+            .ffill()
+            .astype(float)
+        )
+        df["mss_level_down"] = (
+            df["mss_level_down_raw"]
+            .groupby(seg_down)
+            .ffill()
+            .astype(float)
+        )
+
+        # 최종 retest: "리셋이 적용된 레벨" 기준으로 계산
+        lvl_up = df["mss_level_up"]
+        lvl_dn = df["mss_level_down"]
+
         df["retest_long"] = (
-            (df["mss_up"].rolling(lookback, min_periods=1).max() == 1) &
-            (df["low"] <= (lph + tol)) &
-            (df["close"] >= lph) &
-            (df["close"] > df["open"])
+            (df["mss_active_up"] == 1)
+            & lvl_up.notna()
+            & (df["low"] <= (lvl_up + tol))
+            & (df["close"] >= lvl_up)
+            & (df["close"] > df["open"])
         ).fillna(False).astype("int")
 
         df["retest_short"] = (
-            (df["mss_down"].rolling(lookback, min_periods=1).max() == 1) &
-            (df["high"] >= (lpl - tol)) &
-            (df["close"] <= lpl) &
-            (df["close"] < df["open"])
+            (df["mss_active_down"] == 1)
+            & lvl_dn.notna()
+            & (df["high"] >= (lvl_dn - tol))
+            & (df["close"] <= lvl_dn)
+            & (df["close"] < df["open"])
         ).fillna(False).astype("int")
 
-        # 엔진 dropna 방지: 구조 컬럼들도 NaN 없게
+        # dropna 방지(구조 컬럼)
         for c in [
             "pivot_high", "pivot_low",
+            "pivot_high_price", "pivot_low_price",
             "last_pivot_high", "last_pivot_low",
             "sweep_high", "sweep_low",
             "recent_sweep_high", "recent_sweep_low",
-            "mss_up", "mss_down",
+            "mss_up_trigger", "mss_down_trigger",
+            "mss_age_up", "mss_age_down",
+            "mss_active_up", "mss_active_down",
+            "mss_level_up", "mss_level_down",
             "retest_long", "retest_short",
         ]:
             if c in df.columns:
-                df[c] = df[c].fillna(0)
+                # 레벨은 float 유지, 플래그는 int 유지
+                if c in ["pivot_high_price", "pivot_low_price", "last_pivot_high", "last_pivot_low", "mss_level_up", "mss_level_down", "st_val"]:
+                    df[c] = df[c].astype(float)
+                elif c in ["mss_age_up", "mss_age_down"]:
+                    df[c] = df[c].astype(float)
+                else:
+                    df[c] = df[c].fillna(0).astype("int")
 
         return df
 
@@ -333,36 +439,33 @@ class TitanStrategy:
         use_daily = bool(p.get("use_daily_filter", True))
         use_vol = bool(p.get("use_vol_filter", True))
 
-        is_daily_uptrend = (curr["close"] > daily_ema_val) if (use_daily and daily_ok) else True
-        is_daily_downtrend = (curr["close"] < daily_ema_val) if (use_daily and daily_ok) else True
+        is_daily_uptrend = (float(curr["close"]) > daily_ema_val) if (use_daily and daily_ok) else True
+        is_daily_downtrend = (float(curr["close"]) < daily_ema_val) if (use_daily and daily_ok) else True
 
-        vol_ma = curr.get("vol_ma", 0)
-        if pd.isna(vol_ma) or vol_ma <= 0:
-            vol_ma = 0.0
+        # ✅ Volume 필터: prev 기준으로 완전 통일(보수적/정합성 유리)
+        prev_vol_ma = prev.get("vol_ma", 0.0)
+        if pd.isna(prev_vol_ma) or float(prev_vol_ma) <= 0:
+            prev_vol_ma = 0.0
 
-        is_vol = (prev["volume"] > (vol_ma * p["vol_factor"])) if (use_vol and vol_ma > 0) else True
+        is_vol = (float(prev["volume"]) > (float(prev_vol_ma) * float(p["vol_factor"]))) if (use_vol and prev_vol_ma > 0) else True
 
-        # (옵션) ADX를 필터로만 유지 (원하면 off 가능)
-        adx_val = curr.get("adx", 0)
+        # (옵션) ADX를 필터로만 유지
+        adx_val = curr.get("adx", 0.0)
         if pd.isna(adx_val):
             adx_val = 0.0
         is_trend_alive = float(adx_val) > float(p.get("adx_threshold", 0))
 
         # ---------------------------------------------------------
-        # 2. Entry Logic (Liquidity Sweep -> MSS -> Retest Pullback)
+        # 2. Entry Logic (Rejection Sweep -> MSS -> Retest Pullback)
         # ---------------------------------------------------------
-        # 구조형 진입은 "retest_long/short"에서만 트리거
         retest_long = int(curr.get("retest_long", 0)) == 1
         retest_short = int(curr.get("retest_short", 0)) == 1
 
-        # 안전장치: 구조 레벨이 유효할 때만
-        last_high = curr.get("last_pivot_high", 0.0)
-        last_low = curr.get("last_pivot_low", 0.0)
-        level_ok = (pd.notna(last_high) and float(last_high) > 0) or (pd.notna(last_low) and float(last_low) > 0)
+        # MSS 레벨이 살아있는지(스냅샷 기반)
+        lvl_up = curr.get("mss_level_up", np.nan)
+        lvl_dn = curr.get("mss_level_down", np.nan)
+        level_ok = (pd.notna(lvl_up) and float(lvl_up) > 0) or (pd.notna(lvl_dn) and float(lvl_dn) > 0)
 
-        # 필터 결합
-        # - 기본: daily + volume 적용
-        # - adx는 "옵션": 너무 타이트하면 꺼라(파라미터 adx_threshold=0으로도 가능)
         adx_filter_on = float(p.get("adx_threshold", 0)) > 0
 
         if level_ok:
@@ -374,17 +477,29 @@ class TitanStrategy:
                     signal = "SHORT"
 
         # ---------------------------------------------------------
+        # 2.5) Safety: ST 방향/가격 위치 불일치 시 신호 차단(진입 품질 보호)
+        # ---------------------------------------------------------
+        if signal is not None and bool(p.get("use_st_dir_filter", True)):
+            st_dir = int(curr.get("st_dir", 0))
+            st_val = curr.get("st_val", np.nan)
+            close = float(curr["close"])
+            # 일반적으로 st_dir: +1(상승), -1(하락)
+            # LONG이면 상승 추세(ST가 아래)일 때만, SHORT이면 하락 추세(ST가 위)일 때만 허용
+            if signal == "LONG":
+                if (st_dir <= 0) or (pd.notna(st_val) and float(st_val) >= close):
+                    signal = None
+            elif signal == "SHORT":
+                if (st_dir >= 0) or (pd.notna(st_val) and float(st_val) <= close):
+                    signal = None
+
+        # ---------------------------------------------------------
         # 3. Exit (기존 유지: SuperTrend SL + ATR TP)
         # ---------------------------------------------------------
-        sl_val = curr.get("st_val", 0.0)
-        if pd.isna(sl_val):
-            sl_val = 0.0
-        sl_price = float(sl_val)
+        sl_val = curr.get("st_val", np.nan)
+        sl_price = float(sl_val) if (sl_val is not None and not pd.isna(sl_val)) else 0.0
 
         atr = curr.get("atr", 0.0)
-        if pd.isna(atr):
-            atr = 0.0
-        atr = float(atr)
+        atr = float(atr) if not pd.isna(atr) else 0.0
 
         tp_price = 0.0
         if signal == "LONG":

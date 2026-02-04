@@ -1,5 +1,15 @@
 {
-  "positions": {},
-  "last_processed_time": "2026-02-03 23:15:00",
-  "last_bucket": 1966845
+  "positions": {
+    "ARC/USDT:USDT": {
+      "side": "LONG",
+      "amount": 6989.0,
+      "entry_price": 0.07232594362569753,
+      "margin": 194.25576439,
+      "next_sl": 0.07804245009001724,
+      "sl": 0.07693880918910972,
+      "entry_time": "2026-02-04 00:15:00"
+    }
+  },
+  "last_processed_time": "2026-02-04 10:15:00",
+  "last_bucket": 1966889
 }
