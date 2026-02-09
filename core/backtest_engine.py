@@ -267,33 +267,37 @@ class BacktestEngine:
     # =========================================================
     def prepare_data(self, symbols=None):
         """
-        - raw_data_map이 이미 있으면 재다운로드하지 않는다.
-        - 다만, 지표(data_map)는 trial마다 바뀔 수 있으므로 rebuild_indicators()로 재생성한다.
+        - ✅ UF Step2 결과 JSON의 "symbols"만 읽어서 targets로 사용
+        - ✅ raw_data_map 캐시가 있어도 무조건 다시 다운로드(재로드)
+        - ✅ 그 외 로직(블랙리스트 제거, 정렬, self.symbols 갱신)은 기존 유지
         """
-        if self.raw_data_map and len(self.raw_data_map) > 0:
-            return self.raw_data_map
+        logger.info("📥 [Data Loader] Fetching Historical Data... (FORCE REFRESH)")
 
-        logger.info("📥 [Data Loader] Fetching Historical Data...")
-
-        # 외부 주입 심볼 우선순위 처리
+        # ---------------------------------------------------------
+        # 1) 타겟 심볼 결정 (외부 주입 > UF Step2 JSON > 폴백)
+        # ---------------------------------------------------------
         if symbols:
             targets = symbols
+        else:
+            uf_step2_path = r"C:\Quantops2\Phalanx_System\universe_filter\output\universe_step2.json"
+            targets = []
 
-        # ✅ UF JSON 우선 (enabled일 때만)
-        elif self._is_uf_enabled():
-            targets = self._get_universe_from_json()
+            try:
+                if os.path.exists(uf_step2_path):
+                    with open(uf_step2_path, "r", encoding="utf-8") as f:
+                        obj = json.load(f) or {}
+                    if isinstance(obj, dict) and isinstance(obj.get("symbols", None), list):
+                        targets = obj.get("symbols", [])
+            except Exception:
+                targets = []
 
-            # UF 실패/비어있으면 안전 폴백
+            # UF Step2 실패/비어있으면 안전 폴백
             if not targets:
                 targets = self.executor.get_top_targets()
 
-        elif hasattr(self, 'symbols') and self.symbols:
-            targets = self.symbols
-
-        else:
-            targets = self.executor.get_top_targets()
-
-        # 블랙리스트 제거
+        # ---------------------------------------------------------
+        # 2) 블랙리스트 제거 (기존 유지)
+        # ---------------------------------------------------------
         filtered_targets = []
         for sym in targets:
             clean_sym = sym.split(':')[0]
@@ -303,6 +307,9 @@ class BacktestEngine:
 
         targets = filtered_targets
 
+        # ---------------------------------------------------------
+        # 3) 강제 재다운로드 (캐시 무시)
+        # ---------------------------------------------------------
         raw_data_map = self.executor.prepare_data(targets)
 
         if not raw_data_map:
@@ -315,6 +322,7 @@ class BacktestEngine:
         logger.info(f"✅ Raw Data Ready: {len(self.raw_data_map)} symbols loaded.")
         self.symbols = list(self.raw_data_map.keys())
         return self.raw_data_map
+
 
     def rebuild_indicators(self):
         """

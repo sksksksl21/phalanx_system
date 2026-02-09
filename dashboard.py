@@ -30,6 +30,8 @@ import pandas_ta as ta
 import hashlib
 import pickle
 from typing import Optional
+import re
+import datetime as _dt
 
 
 
@@ -64,6 +66,35 @@ LIVE_LIMIT = 300               # 라이브 차트 캔들 개수
 # ✅ [NEW] pick the most recently updated runtime files (fix path mismatch)
 
 KST_TZ = "Asia/Seoul"
+
+def _to_kst_naive(x) -> pd.Timestamp:
+    """
+    어떤 타입이 와도 'KST tz-naive Timestamp'로 정규화.
+    - tz-aware면 KST로 tz_convert 후 tz_localize(None)
+    - tz-naive면 KST-naive로 간주(그대로)
+    """
+    ts = pd.Timestamp(x)
+
+    # pandas Timestamp의 tz 정보는 ts.tz 로 확인 가능
+    if getattr(ts, "tz", None) is not None:
+        return ts.tz_convert(KST_TZ).tz_localize(None)
+
+    # tz-naive: 이미 KST-naive로 취급
+    return ts
+
+
+def _now_kst_naive() -> pd.Timestamp:
+    """
+    '현재 시각'을 KST tz-naive로 반환 (pandas 버전별 utcnow() tz 동작 차이 방어)
+    """
+    ts = pd.Timestamp.utcnow()
+    if getattr(ts, "tz", None) is None:
+        # tz-naive UTC → tz-aware UTC → KST → naive
+        ts = ts.tz_localize("UTC").tz_convert(KST_TZ).tz_localize(None)
+    else:
+        # 이미 tz-aware면 convert 후 naive
+        ts = ts.tz_convert(KST_TZ).tz_localize(None)
+    return ts
 
 # ---- [NEW] robust file resolver (pick the most recently updated file) ----
 def _candidate_roots(*paths: str) -> list[str]:
@@ -272,9 +303,21 @@ def save_ohlcv_pkl(df: pd.DataFrame, symbol: str, timeframe: str, since_ms: int,
     except Exception:
         return None
 
-def _to_utc_ms_kst_naive(dt_kst_naive) -> int:
-    ts = pd.Timestamp(dt_kst_naive).tz_localize(KST_TZ).tz_convert("UTC")
-    return int(ts.timestamp() * 1000)
+def _to_utc_ms_kst_naive(dt_like) -> int:
+    """
+    입력을 'KST 기준'으로 해석해서 UTC ms로 변환.
+    - tz-naive: KST-naive로 간주하고 tz_localize(KST)
+    - tz-aware: KST로 tz_convert
+    """
+    ts = pd.Timestamp(dt_like)
+
+    if getattr(ts, "tz", None) is None:
+        ts = ts.tz_localize(KST_TZ)
+    else:
+        ts = ts.tz_convert(KST_TZ)
+
+    ts_utc = ts.tz_convert("UTC")
+    return int(ts_utc.timestamp() * 1000)
 
 if os.path.exists(RUNTIME_CACHE_FILE):
     try:
@@ -419,6 +462,63 @@ def load_bundle_pkl(path: str):
     return None
 
 
+def parse_reason_kv(reason: str) -> dict:
+    """
+    reason 문자열에서 key=value 패턴을 최대한 회수한다.
+    예: "... | apply_mode=next | old_sl=... new_sl=... cur_sl=... next_sl=... | emergency=1"
+    """
+    s = (reason or "").strip()
+    out = {}
+
+    # 1) key=value (공백/파이프 섞임 허용)
+    for m in re.finditer(r"([A-Za-z_]+)\s*=\s*([^\s|]+)", s):
+        k = m.group(1).strip().lower()
+        v = m.group(2).strip()
+        out[k] = v
+
+    # 2) 토글성 플래그(키만 등장)도 일부 회수
+    #    (필요 시 확장)
+    if "emergency" in s.lower() and "emergency" not in out:
+        out["emergency"] = "1"
+
+    return out
+
+def _to_float_safe(x):
+    try:
+        if x in (None, "", "None", "nan", "NaN"):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def enrich_history_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    trade_history.csv 로드 후:
+    - emergency / apply_mode / kind / new_sl / cur_sl / next_sl 등을 reason에서 파싱해서 컬럼으로 추가
+    """
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+    if "reason" not in d.columns:
+        d["reason"] = ""
+
+    parsed = d["reason"].astype(str).map(parse_reason_kv)
+
+    d["apply_mode"] = parsed.map(lambda x: (x.get("apply_mode") or "").lower())
+    d["kind"] = parsed.map(lambda x: (x.get("kind") or "").upper())
+
+    # emergency 판단: emergency=1 또는 close_call=1 같은 강제청산 트리거를 함께 묶어도 됨
+    d["emergency"] = parsed.map(lambda x: 1 if str(x.get("emergency","0")) in ("1","true","True") else 0)
+    d["close_call"] = parsed.map(lambda x: 1 if str(x.get("close_call","0")) in ("1","true","True") else 0)
+
+    d["new_sl_parsed"]  = parsed.map(lambda x: _to_float_safe(x.get("new_sl")))
+    d["cur_sl_parsed"]  = parsed.map(lambda x: _to_float_safe(x.get("cur_sl")))
+    d["next_sl_parsed"] = parsed.map(lambda x: _to_float_safe(x.get("next_sl")))
+    d["old_sl_parsed"]  = parsed.map(lambda x: _to_float_safe(x.get("old_sl")))
+
+    return d
+
 
 def load_trade_history(filepath: str) -> pd.DataFrame:
     """
@@ -543,6 +643,8 @@ def load_trade_history(filepath: str) -> pd.DataFrame:
         df["event_u"] = df["event"].astype(str).str.upper().str.strip()
         df["side_u"]  = df["side"].astype(str).str.upper().str.strip()
         df["symbol_n"] = df["symbol"].astype(str).map(_norm_sym)
+        df = enrich_history_fields(df)
+        df = add_exit_kind_columns(df)
 
         return df.sort_values("dt", ascending=True).reset_index(drop=True)
 
@@ -577,6 +679,8 @@ def load_trade_history(filepath: str) -> pd.DataFrame:
                     df_try["event_u"] = df_try["event"].astype(str).str.upper().str.strip()
                     df_try["side_u"]  = df_try.get("side", "").astype(str).str.upper().str.strip()
                     df_try["symbol_n"] = df_try.get("symbol", "").astype(str).map(_norm_sym)
+                    df_try = enrich_history_fields(df_try)
+                    df_try = add_exit_kind_columns(df_try)
 
                     return df_try.sort_values("dt", ascending=True).reset_index(drop=True)
 
@@ -663,6 +767,82 @@ def build_trade_windows_from_events(ev: pd.DataFrame) -> list[dict]:
 
     return wins
 
+def _to_py_datetime(x):
+    """pandas Timestamp -> python datetime (naive)"""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, pd.Timestamp):
+            return x.to_pydatetime()
+        if isinstance(x, _dt.datetime):
+            return x
+        return pd.Timestamp(x).to_pydatetime()
+    except Exception:
+        return x
+
+def safe_add_vline(fig, x, **kwargs):
+    """
+    plotly add_vline(annotation=...) datetime 이슈 우회:
+    - fig.add_shape(line)로 vline 추가
+    - annotation_text가 있으면 fig.add_annotation으로 별도 추가
+    """
+    x = _to_py_datetime(x)
+
+    # ---- line kwargs 추출 (add_shape용) ----
+    line = {}
+    if "line_dash" in kwargs:
+        line["dash"] = kwargs.pop("line_dash")
+    if "line_width" in kwargs:
+        line["width"] = kwargs.pop("line_width")
+    if "line_color" in kwargs:
+        line["color"] = kwargs.pop("line_color")
+
+    if not line:
+        line = {"dash": "solid"}
+
+    # ---- annotation kwargs 추출 ----
+    ann_text = kwargs.pop("annotation_text", None)
+    ann_pos  = kwargs.pop("annotation_position", "top left")
+
+    # add_vline 호환 인자 제거
+    kwargs.pop("row", None)
+    kwargs.pop("col", None)
+    kwargs.pop("exclude_empty_subplots", None)
+    kwargs.pop("annotation", None)
+
+    fig.add_shape(
+        type="line",
+        x0=x, x1=x,
+        y0=0, y1=1,
+        xref="x",
+        yref="paper",
+        line=line,
+    )
+
+    if ann_text:
+        pos = str(ann_pos).lower()
+        if "top" in pos:
+            y = 1.0
+            yanchor = "bottom"
+        else:
+            y = 0.0
+            yanchor = "top"
+
+        xanchor = "right" if "right" in pos else "left"
+
+        fig.add_annotation(
+            x=x, y=y,
+            xref="x", yref="paper",
+            text=str(ann_text),
+            showarrow=False,
+            xanchor=xanchor,
+            yanchor=yanchor,
+        )
+
+    return fig
+
+
+
 def plot_history_trade_window(symbol: str, ev_sym: pd.DataFrame, w: dict, pad_hours: int = 3):
     """
     symbol: "XRP/USDT:USDT" 또는 "XRP/USDT" 모두 OK
@@ -676,16 +856,19 @@ def plot_history_trade_window(symbol: str, ev_sym: pd.DataFrame, w: dict, pad_ho
     t0 = w["t0"]
     t1 = w.get("t1", None)
 
-    # 범위: entry~exit (+/- pad)
-    start_dt = (pd.Timestamp(t0) - pd.Timedelta(hours=int(pad_hours))).to_pydatetime()
-    end_base = pd.Timestamp(t1) if t1 is not None else pd.Timestamp.utcnow().tz_localize("UTC").tz_convert(KST_TZ).tz_localize(None)
-    end_dt = (end_base + pd.Timedelta(hours=int(pad_hours))).to_pydatetime()
+    # ✅ 모든 계산을 'KST tz-naive Timestamp'로 고정
+    t0_kst = _to_kst_naive(t0)
+    t1_kst = _to_kst_naive(t1) if t1 is not None else _now_kst_naive()
 
+    start_kst = t0_kst - pd.Timedelta(hours=int(pad_hours))
+    end_kst   = t1_kst + pd.Timedelta(hours=int(pad_hours))
+
+    # fetch 함수는 "KST naive"를 받도록 설계되어 있으니 그대로 넘김
     ohlcv, saved_fp, status = fetch_ohlcv_range_with_cache(
         symbol=symbol,
         timeframe="15m",
-        t0_kst_naive=start_dt,
-        t1_kst_naive=end_dt,
+        t0_kst_naive=start_kst.to_pydatetime(),
+        t1_kst_naive=end_kst.to_pydatetime(),
         limit=1500
     )
 
@@ -724,22 +907,33 @@ def plot_history_trade_window(symbol: str, ev_sym: pd.DataFrame, w: dict, pad_ho
 
     e_in = d[d["event_u"] == "ENTRY"]
     if not e_in.empty:
+        safe_add_vline(
+            fig,
+            e_in.iloc[0]["dt"],
+            line_dash="solid",
+            annotation_text="ENTRY",
+            annotation_position="top left",
+        )
         fig.add_trace(go.Scatter(
             x=e_in["dt"], y=e_in["px"], mode="markers", name="ENTRY",
-            marker=dict(symbol="triangle-up", size=12),
+            marker=dict(symbol="triangle-up", size=18),
         ))
 
-    e_out = d[d["event_u"] == "EXIT"]
+    e_out = d[d["event_u"] == "EXIT"].copy()
     if not e_out.empty:
+        if "exit_kind" not in e_out.columns:
+            e_out = add_exit_kind_columns(e_out)
+
         fig.add_trace(go.Scatter(
             x=e_out["dt"], y=e_out["px"], mode="markers", name="EXIT",
             marker=dict(symbol="x", size=12),
             text=e_out.get("reason", ""),
-            hovertemplate="EXIT<br>%{x}<br>price=%{y}<br>%{text}<extra></extra>",
+            customdata=e_out.get("exit_kind", "").astype(str),
+            hovertemplate="EXIT<br>%{x}<br>price=%{y}<br>kind=%{customdata}<br>%{text}<extra></extra>",
         ))
 
     if sl_step is not None and sl_step.notna().any():
-        fig.add_trace(go.Scatter(x=ohlcv.index, y=sl_step, mode="lines", name="SL(step)", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=ohlcv.index, y=sl_step, mode="lines", name="SL(step)", line=dict(width=4)))
 
     src = "pkl_hit" if status == "pkl_hit" else status
     fig.update_layout(
@@ -749,7 +943,7 @@ def plot_history_trade_window(symbol: str, ev_sym: pd.DataFrame, w: dict, pad_ho
         xaxis_rangeslider_visible=False,
         showlegend=True,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 HIST_KEEP_EVENTS = {"ENTRY", "EXIT", "UPDATE_SL"}
@@ -830,39 +1024,73 @@ def build_sl_step_for_window(candle_index: pd.Index, ev: pd.DataFrame, win: dict
 
     t0 = win["t0"]
     t1 = win.get("t1", None)
-    idx = candle_index[candle_index >= t0] if t1 is None else candle_index[(candle_index >= t0) & (candle_index <= t1)]
+
+    if t1 is None:
+        idx = candle_index[candle_index >= t0]
+    else:
+        idx = candle_index[(candle_index >= t0) & (candle_index <= t1)]
     if len(idx) == 0:
         return None
 
     d = ev.sort_values("dt", ascending=True).reset_index(drop=True)
 
     # 윈도우 내부 UPDATE_SL
-    u = d[(d["event_u"] == "UPDATE_SL") & (d["dt"] >= t0)].copy()
+    u = d[(d.get("event_u", d.get("event","")).astype(str).str.upper().str.strip() == "UPDATE_SL") & (d["dt"] >= t0)].copy()
     if t1 is not None:
         u = u[u["dt"] <= t1]
-    u = u.dropna(subset=["dt", "sl_price"])
+
+    # SL 후보:
+    # - 우선 reason에서 파싱한 new_sl_parsed를 사용 (없으면 sl_price fallback)
+    if "new_sl_parsed" in u.columns:
+        u["sl_eff"] = u["new_sl_parsed"]
+    else:
+        u["sl_eff"] = pd.to_numeric(u.get("sl", pd.NA), errors="coerce")
+
+    if "sl_price" in u.columns:
+        u["sl_eff"] = u["sl_eff"].where(u["sl_eff"].notna(), u["sl_price"])
+
+    # apply_mode
+    if "apply_mode" not in u.columns:
+        u["apply_mode"] = ""
+    u["apply_mode"] = u["apply_mode"].fillna("").astype(str).str.lower()
+
+    u = u.dropna(subset=["dt", "sl_eff"]).sort_values("dt", ascending=True)
 
     s = pd.Series(index=idx, dtype="float64")
 
-    # 초기 SL: ENTRY의 sl_price 우선, 없으면 첫 UPDATE_SL
+    # 초기 SL: ENTRY sl_price -> entry row sl -> 첫 update_sl
     sl0 = None
-    ent = d[(d["event_u"] == "ENTRY") & (d["dt"] == t0)]
+    ent = d[(d.get("event_u", d.get("event","")).astype(str).str.upper().str.strip() == "ENTRY") & (d["dt"] == t0)]
     if not ent.empty:
         v = ent.iloc[0].get("sl_price", None)
         if pd.notna(v):
             sl0 = float(v)
+        if sl0 is None:
+            v2 = ent.iloc[0].get("sl", None)
+            if pd.notna(v2):
+                sl0 = float(v2)
+
     if sl0 is None and not u.empty:
-        sl0 = float(u.iloc[0]["sl_price"])
+        sl0 = float(u.iloc[0]["sl_eff"])
 
     if sl0 is not None:
         s.iloc[0] = sl0
 
-    # UPDATE_SL 계단
+    # UPDATE_SL 반영:
+    # - apply_mode=next면 "다음 캔들부터" 효력
     for _, r in u.iterrows():
         t = r["dt"]
-        slv = float(r["sl_price"])
-        k = idx.searchsorted(t, side="right") - 1
-        if k >= 0:
+        slv = float(r["sl_eff"])
+        mode = str(r.get("apply_mode","")).lower()
+
+        if mode == "next":
+            # 다음 캔들 위치로 이동
+            k = idx.searchsorted(t, side="right")  # right => t 이후 첫 캔들
+        else:
+            # same 또는 미기재: 현재 캔들에 바로 반영
+            k = idx.searchsorted(t, side="right") - 1
+
+        if 0 <= k < len(idx):
             s.iloc[k] = slv
 
     s = s.ffill()
@@ -1035,7 +1263,7 @@ def plot_history_trade_symbol(symbol_n: str, hist_clean_df: pd.DataFrame):
         xaxis_rangeslider_visible=False,
         showlegend=True,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 
@@ -1065,6 +1293,43 @@ def filter_history_since_last_boot(history_df, mode="LIVE"):
     df.drop(columns=["event_u"], errors="ignore", inplace=True)
     return df
 
+def add_exit_kind_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    EXIT 이벤트의 청산 사유를 분류:
+      - STOP_LOSS
+      - EMERGENCY_STOP
+    (CSV 포맷: reason 컬럼에 사유 토큰이 들어오는 형태 가정)
+    """
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+
+    # event_u 확보
+    if "event_u" not in d.columns:
+        d["event_u"] = d.get("event", "").fillna("").astype(str).str.upper().str.strip()
+    d["event_u"] = d["event_u"].astype(str).str.upper().str.strip().str.replace(" ", "_", regex=False)
+
+    # reason 텍스트(대문자)
+    if "reason" not in d.columns:
+        d["reason"] = ""
+    r = d["reason"].fillna("").astype(str).str.upper()
+
+    # EXIT 타입
+    d["exit_kind"] = ""
+    is_exit = d["event_u"].eq("EXIT")
+
+    # 우선순위: EMERGENCY_STOP > STOP_LOSS
+    d.loc[is_exit & r.str.contains("EMERGENCY_STOP", na=False), "exit_kind"] = "EMERGENCY_STOP"
+    d.loc[is_exit & d["exit_kind"].eq("") & r.str.contains("STOP_LOSS", na=False), "exit_kind"] = "STOP_LOSS"
+
+    # 집계용 플래그
+    d["is_emergency_exit"] = (d["exit_kind"] == "EMERGENCY_STOP").astype(int)
+    d["is_stoploss_exit"] = (d["exit_kind"] == "STOP_LOSS").astype(int)
+
+    return d
+
+
 def summarize_history(df_hist: pd.DataFrame):
     if df_hist is None or df_hist.empty:
         return {
@@ -1077,6 +1342,8 @@ def summarize_history(df_hist: pd.DataFrame):
         }
 
     d = df_hist.copy()
+    d = add_exit_kind_columns(d)
+
     d["event_u"] = d["event"].astype(str).str.upper()
 
     exits = d[d["event_u"].str.contains("EXIT", na=False)]
@@ -1110,6 +1377,8 @@ def summarize_history(df_hist: pd.DataFrame):
         "pnl_sum": pnl_sum,
         "pnl_sum_50": pnl_sum_50,
         "last_event": last_event,
+        "emergency_exits": int(d["is_emergency_exit"].sum()) if "is_emergency_exit" in d.columns else 0,
+        "stoploss_exits": int(d["is_stoploss_exit"].sum()) if "is_stoploss_exit" in d.columns else 0,
     }
 
 # =========================
@@ -1200,58 +1469,6 @@ def extract_trade_windows(ev: pd.DataFrame) -> list[dict]:
 
 
 
-def build_sl_step_for_window(candle_index: pd.Index, ev: pd.DataFrame, win: dict) -> pd.Series | None:
-    if candle_index is None or len(candle_index) == 0 or ev is None or ev.empty or not win:
-        return None
-
-    t0 = win["t0"]
-    t1 = win.get("t1", None)
-
-    if t1 is None:
-        idx = candle_index[candle_index >= t0]
-    else:
-        idx = candle_index[(candle_index >= t0) & (candle_index <= t1)]
-
-    if len(idx) == 0:
-        return None
-
-    d = ev.sort_values("dt", ascending=True).reset_index(drop=True)
-
-    # 윈도우 내부 UPDATE_SL
-    u = d[(d["event_u"] == "UPDATE_SL") & (d["dt"] >= t0)].copy()
-    if t1 is not None:
-        u = u[u["dt"] <= t1]
-    u = u.dropna(subset=["dt", "sl_price"])
-
-    s = pd.Series(index=idx, dtype="float64")
-
-    # 0) 초기 SL: ENTRY sl_price가 있으면 사용, 없으면 윈도우 내 첫 UPDATE_SL을 시작값으로 사용
-    sl0 = None
-    ent = d[(d["event_u"] == "ENTRY") & (d["dt"] == t0)]
-    if not ent.empty:
-        v = ent.iloc[0].get("sl_price", None)
-        if pd.notna(v):
-            sl0 = float(v)
-
-    if sl0 is None and not u.empty:
-        sl0 = float(u.iloc[0]["sl_price"])
-
-    if sl0 is not None:
-        s.iloc[0] = sl0
-
-    # 1) UPDATE_SL 계단 반영
-    for _, r in u.iterrows():
-        t = r["dt"]
-        slv = float(r["sl_price"])
-        k = idx.searchsorted(t, side="right") - 1
-        if k >= 0:
-            s.iloc[k] = slv
-
-    s = s.ffill()
-
-    full = pd.Series(index=candle_index, dtype="float64")
-    full.loc[idx] = s
-    return full
 
 
 
@@ -1551,6 +1768,10 @@ top_c3.metric("Total Equity (USDT)", f"${total_equity:,.2f}")
 top_c4.metric("Free (USDT)", f"${free_money:,.2f}")
 top_c5.metric("Unrealized PnL", f"${unreal_pnl:,.2f}")
 
+c5, c6 = st.columns(2)
+c5.metric("Emergency Exits (session)", f"{hist_summary.get('emergency_exits',0)}")
+c6.metric("StopLoss Exits (session)", f"{hist_summary.get('stoploss_exits',0)}")
+
 st.divider()
 
 
@@ -1662,7 +1883,7 @@ def plot_live_position_chart(symbol: str, pos: dict):
         xaxis_rangeslider_visible=False,
         showlegend=False,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 # Tab 1: Live Status
@@ -1721,6 +1942,8 @@ with tab2:
     clean = filter_clean_trade_events(src_df)
 
     with st.expander("TAB2 DEBUG (필수)", expanded=True):
+
+        
         st.write("HISTORY_FILE:", HISTORY_FILE)
         st.write("rows(all):", 0 if hist_df_all is None else len(hist_df_all))
         st.write("rows(src_df):", 0 if src_df is None else len(src_df))
@@ -1734,6 +1957,13 @@ with tab2:
                 tmp["event_u"] = tmp["event_u"].str.replace(" ", "_", regex=False).str.replace("-", "_", regex=False)
 
             st.write("unique event_u (top 30):", tmp["event_u"].value_counts().head(30))
+
+            tmp = add_exit_kind_columns(tmp)
+            ex = tmp[tmp["event_u"] == "EXIT"].copy()
+            st.write("EXIT kind counts:", ex["exit_kind"].value_counts(dropna=False).head(10))
+            st.write("emergency_exits:", int(ex["is_emergency_exit"].sum()) if "is_emergency_exit" in ex.columns else 0)
+            st.write("stoploss_exits:", int(ex["is_stoploss_exit"].sum()) if "is_stoploss_exit" in ex.columns else 0)
+
             st.write("sample rows (tail 30):")
             show_cols = [c for c in ["dt","event","event_u","mode","symbol","symbol_n","side","price","sl","reason"] if c in tmp.columns]
             st.dataframe(tmp[show_cols].tail(30), width="stretch", hide_index=True)

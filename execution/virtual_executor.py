@@ -27,15 +27,53 @@ class VirtualExecutor:
     - Full Integration with HistoryManager
     - Symbol-level Performance Tracking
     """
+    def _load_config(self):
+        """
+        root_dir/config.json 로드.
+        - 실패해도 시스템이 죽지 않도록 빈 dict 반환
+        """
+        import json
 
+        cfg_path = os.path.join(root_dir, "config.json")
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"[VirtualExecutor] config.json load failed: {e}")
+            return {}
+    def _apply_risk_settings(self, cfg: dict):
+        """
+        라이브와 동일한 risk_settings를 VirtualExecutor에 주입
+        """
+        rs = (cfg or {}).get("risk_settings", {}) if isinstance(cfg, dict) else {}
+
+        # 핵심: max_open_positions 정합성
+        max_pos = rs.get("max_open_positions", None)
+        if isinstance(max_pos, (int, float)) and int(max_pos) > 0:
+            self.MAX_POSITIONS = int(max_pos)
+        else:
+            # config가 없거나 값이 이상하면 기존 기본값 유지(여기선 20이 아니라, 라이브 기본과 맞추려면 5로 두는 게 안전)
+            self.MAX_POSITIONS = 5
+
+        # 아래는 “있으면 맞추는” 정도 (다른 모듈에서 이미 쓰고 있으면 그쪽이 권위)
+        lev = rs.get("leverage", None)
+        self.leverage = int(lev) if isinstance(lev, (int, float)) and int(lev) > 0 else 1
+
+        self.disable_side_exposure_limit = bool(rs.get("disable_side_exposure_limit", False))
+        mse = rs.get("max_side_exposure", None)
+        self.max_side_exposure = int(mse) if isinstance(mse, (int, float)) and int(mse) > 0 else None
+
+
+        
     def __init__(self):
         self.equity = INITIAL_EQUITY
         self.cash = INITIAL_EQUITY
         self.positions = {}
         self.history = []   # 인메모리 로그 (콘솔 리포트용)
         self.equity_curve = []
-        self.MAX_POSITIONS = 20
-
+        self.config = self._load_config()
+        self._apply_risk_settings(self.config)
+        
         # [DATA DRIVEN] HistoryManager 초기화
         csv_path = os.path.join(root_dir, "backtest_history.csv")
         # 백테스트 시작 시 기존 기록 삭제 (Clean State)
@@ -165,7 +203,7 @@ class VirtualExecutor:
                 targets.append((s, vol))
 
         targets.sort(key=lambda x: x[1], reverse=True)
-        return [t[0] for t in targets][:100]  # <-- 항상 list
+        return [t[0] for t in targets][:30]  # <-- 항상 list
 
     def prepare_data(self, symbols, days=30):
         # (기존 데이터 다운로드 로직 유지)

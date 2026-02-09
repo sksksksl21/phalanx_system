@@ -1,15 +1,54 @@
 {
   "positions": {
-    "ARC/USDT:USDT": {
+    "PIPPIN/USDT:USDT": {
       "side": "LONG",
-      "amount": 6989.0,
-      "entry_price": 0.07232594362569753,
-      "margin": 194.25576439,
-      "next_sl": 0.07804245009001724,
-      "sl": 0.07693880918910972,
-      "entry_time": "2026-02-04 00:15:00"
+      "amount": 1720.0,
+      "entry_price": 0.2838431395348837,
+      "margin": 160.82573655,
+      "sl": 0.2645580624178937,
+      "entry_time": "2026-02-09 20:30:00",
+      "entry_atr": 0.007188872304082371,
+      "next_sl": null,
+      "trail_sl": null,
+      "peak_high": 0.28233
+    },
+    "BCH/USDT:USDT": {
+      "side": "LONG",
+      "amount": 0.91,
+      "entry_price": 535.3,
+      "margin": 161.91880324,
+      "sl": 527.6250210448294,
+      "entry_time": "2026-02-09 20:00:00",
+      "entry_atr": 2.8829015801650013,
+      "next_sl": null,
+      "trail_sl": null,
+      "peak_high": 534.9
+    },
+    "XRP/USDT:USDT": {
+      "side": "LONG",
+      "amount": 338.4,
+      "entry_price": 1.4528,
+      "margin": 162.93996648,
+      "sl": 1.4229530887422381,
+      "entry_time": "2026-02-09 16:30:00",
+      "entry_atr": 0.011552183638764228,
+      "next_sl": null,
+      "trail_sl": null,
+      "peak_high": 1.4483
+    },
+    "DUSK/USDT:USDT": {
+      "side": "LONG",
+      "amount": 4437.0,
+      "entry_price": 0.11006,
+      "margin": 161.75679861,
+      "sl": 0.1038126424819759,
+      "entry_time": "2026-02-09 22:00:00",
+      "entry_atr": 0.002362349564781066,
+      "next_sl": null,
+      "trail_sl": null,
+      "peak_high": 0.11049
     }
   },
-  "last_processed_time": "2026-02-04 10:15:00",
-  "last_bucket": 1966889
+  "last_processed_time": "2026-02-09 22:45:00",
+  "last_bucket": 1967420
 }

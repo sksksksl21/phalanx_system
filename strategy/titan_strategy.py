@@ -26,19 +26,20 @@ class TitanStrategy:
         # =====================================================================
         # [Versioning]
         # =====================================================================
-        self.__version__ = "8.2.0-LiquidityMSSPullback-IntegrityFix"
+        self.__version__ = "8.2.1-LiquidityMSSPullback-VolScoreOnly"
 
         # =====================================================================
-        # [Hyperopt 대상 파라미터]
+        # [Hyperopt 대상 파라미터]30	2	17	75	32	1	200	5	3	90	0.4
+
         # =====================================================================
         self.params = {
             # --- 15분봉(Intraday) 설정 ---
-            "atr_period": 25,
-            "atr_multiplier": 4.5,
+            "atr_period": 30,
+            "atr_multiplier": 2.0,
             "adx_threshold": 17,  # (옵션) 필터로만 사용
-            "rsi_upper": 73,      # (옵션) 필터로만 사용
-            "rsi_lower": 28,      # (옵션) 필터로만 사용
-            "vol_factor": 0.9,
+            "rsi_upper": 75,      # (옵션) 필터로만 사용
+            "rsi_lower": 32,      # (옵션) 필터로만 사용
+            "vol_factor": 1.0,    # 볼륨 신뢰도 점수 기준(게이트 아님)
             "ema_intraday": 200,
 
             # --- 일봉(Daily) 설정 ---
@@ -46,10 +47,10 @@ class TitanStrategy:
 
             # --- Market Structure / Liquidity 설정 ---
             "swing_len": 3,               # pivot 길이(프랙탈)
-            "context_lookback": 120,      # MSS 유효기간/스윕 컨텍스트
-            "retest_tolerance_atr": 0.25, # retest 레벨 허용오차(ATR 비율)
+            "context_lookback": 90,      # MSS 유효기간/스윕 컨텍스트
+            "retest_tolerance_atr": 0.4, # retest 레벨 허용오차(ATR 비율)
             "use_daily_filter": True,     # 일봉 EMA 필터 사용 여부
-            "use_vol_filter": True,       # 거래량 필터 사용 여부
+            "use_vol_filter": True,       # ✅ Gate 제거. 신뢰도 점수 계산만.
 
             # --- Safety (정합성/운영 안정) ---
             "use_st_dir_filter": True,    # 진입 방향과 ST 방향 불일치 시 신호 차단
@@ -173,6 +174,42 @@ class TitanStrategy:
             return None, False
 
     # =========================================================
+    # Volume = Score only (NO GATE)
+    # =========================================================
+    def _calc_vol_score(self, curr, prev, p):
+        """
+        볼륨은 Gate가 아니라 '신뢰도 점수'로만 반영한다.
+
+        반환:
+          (vol_ok_like_bool, vol_ratio, vol_score)
+            - vol_ok_like_bool: 기존 기준(> vol_ma*vol_factor) 통과 여부(참고용)
+            - vol_ratio: prev.volume / prev.vol_ma
+            - vol_score: -1.0 ~ +1.0 (신뢰도/우선순위)
+        """
+        use_vol = bool(p.get("use_vol_filter", True))
+        if not use_vol:
+            return True, 1.0, 0.0
+
+        try:
+            prev_vol = float(prev.get("volume", 0) or 0)
+            prev_vol_ma = float(prev.get("vol_ma", 0) or 0)
+            if prev_vol_ma <= 0:
+                return True, 1.0, 0.0
+
+            vol_ratio = prev_vol / prev_vol_ma
+            thr = float(p.get("vol_factor", 1.0) or 1.0)
+
+            vol_ok_like = bool(prev_vol > (prev_vol_ma * thr))
+
+            denom = max(thr, 1e-12)
+            raw = (vol_ratio / denom) - 1.0
+            vol_score = float(np.clip(raw, -1.0, 1.0))
+
+            return vol_ok_like, float(vol_ratio), float(vol_score)
+        except Exception:
+            return True, 1.0, 0.0
+
+    # =========================================================
     # Market Structure Helpers (Pure, no I/O)
     # =========================================================
     def _compute_pivots_confirmed(self, df: pd.DataFrame, swing_len: int):
@@ -246,7 +283,6 @@ class TitanStrategy:
 
         df["st_val"] = st_val_ser if st_val_ser is not None else np.nan
         if st_dir_ser is not None:
-            # 보통 +1 / -1
             df["st_dir"] = st_dir_ser.astype("float").round(0).astype("int")
         else:
             df["st_dir"] = 0
@@ -263,6 +299,22 @@ class TitanStrategy:
             df["ema_daily_ok"] = 1
 
         # =========================================================
+        # 2.5 Volume score columns (NO GATE)
+        #   - prev 기준으로 스냅샷(로그와 동일하게 맞추기 위해 shift(1) 사용)
+        # =========================================================
+        prev_vol_ma = df["vol_ma"].shift(1)
+        prev_vol = df["volume"].shift(1)
+        thr = float(p.get("vol_factor", 1.0) or 1.0)
+
+        # ratio / ok_like / score
+        df["vol_ratio_prev"] = (prev_vol / prev_vol_ma.replace(0, np.nan)).astype(float)
+        df["vol_ok_like_prev"] = ((prev_vol_ma > 0) & (prev_vol > (prev_vol_ma * thr))).astype("int")
+
+        denom = max(thr, 1e-12)
+        raw = (df["vol_ratio_prev"] / denom) - 1.0
+        df["vol_score_prev"] = raw.clip(-1.0, 1.0).fillna(0.0).astype(float)
+
+        # =========================================================
         # 3. Market Structure / Liquidity (15m)
         # =========================================================
         swing_len = int(p.get("swing_len", 5))
@@ -274,19 +326,17 @@ class TitanStrategy:
         df["pivot_high"] = ph_c
         df["pivot_low"] = pl_c
 
-        # pivot price: float 유지(np.nan)
         n = int(max(1, swing_len))
         df["pivot_high_price"] = np.where(df["pivot_high"] == 1, df["high"].shift(n).astype(float), np.nan)
         df["pivot_low_price"] = np.where(df["pivot_low"] == 1, df["low"].shift(n).astype(float), np.nan)
 
-        # 최근 pivot 레벨을 계속 들고감
         df["last_pivot_high"] = pd.Series(df["pivot_high_price"], index=df.index).ffill()
         df["last_pivot_low"] = pd.Series(df["pivot_low_price"], index=df.index).ffill()
 
         lph = df["last_pivot_high"].astype(float)
         lpl = df["last_pivot_low"].astype(float)
 
-        # 3-2) Liquidity sweep (Rejection sweep ONLY: 채택한 철학)
+        # 3-2) Liquidity sweep (Rejection sweep ONLY)
         df["sweep_high"] = ((df["high"] > lph) & (df["close"] < lph) & lph.notna()).astype("int")
         df["sweep_low"] = ((df["low"] < lpl) & (df["close"] > lpl) & lpl.notna()).astype("int")
 
@@ -294,9 +344,7 @@ class TitanStrategy:
         df["recent_sweep_high"] = df["sweep_high"].rolling(lookback, min_periods=1).max().fillna(0).astype("int")
         df["recent_sweep_low"] = df["sweep_low"].rolling(lookback, min_periods=1).max().fillna(0).astype("int")
 
-        # 3-4) MSS 트리거(발생 순간) + 레벨 스냅샷
-        # - bullish MSS: 최근 low sweep 컨텍스트 + 종가가 pivot_high 레벨 상향 돌파
-        # - bearish MSS: 최근 high sweep 컨텍스트 + 종가가 pivot_low 레벨 하향 돌파
+        # 3-4) MSS 트리거 + 레벨 스냅샷
         mss_up_trigger = (
             (df["recent_sweep_low"] == 1)
             & lph.notna()
@@ -314,31 +362,22 @@ class TitanStrategy:
         df["mss_up_trigger"] = mss_up_trigger
         df["mss_down_trigger"] = mss_down_trigger
 
-        # MSS 레벨 스냅샷(트리거 순간의 기준 레벨)
         df["mss_level_up_raw"] = np.where(df["mss_up_trigger"] == 1, lph.astype(float), np.nan)
         df["mss_level_down_raw"] = np.where(df["mss_down_trigger"] == 1, lpl.astype(float), np.nan)
 
-        # MSS age(유효기간 관리)
         df["mss_age_up"] = self._age_from_triggers(df["mss_up_trigger"])
         df["mss_age_down"] = self._age_from_triggers(df["mss_down_trigger"])
 
         df["mss_active_up"] = ((df["mss_age_up"].notna()) & (df["mss_age_up"] <= lookback)).astype("int")
         df["mss_active_down"] = ((df["mss_age_down"].notna()) & (df["mss_age_down"] <= lookback)).astype("int")
 
-        # 3-5) Retest (Pullback) 트리거
+        # 3-5) Retest
         atr = df["atr"].astype(float).fillna(0.0)
         tol = atr * tol_atr
 
-        # MSS 이후 유지되는 레벨(리테스트까지 고정)
-        # 정책: "MSS 발생 -> 레벨 유지 -> retest 발생 시 리셋 -> 다음 MSS까지 대기"
-        # 이를 위해 (MSS 트리거 OR retest 발생) 때마다 세그먼트가 끊기게 만든다.
-        # (리테스트는 아래에서 계산하므로, 일단 raw ffill로 1차 후보 생성 후 retest 계산 -> 리셋 적용)
         level_up_ffill = pd.Series(df["mss_level_up_raw"], index=df.index).ffill()
         level_down_ffill = pd.Series(df["mss_level_down_raw"], index=df.index).ffill()
 
-        # 1차 리테스트 계산(리셋 적용 전)
-        # - LONG: MSS active + 레벨 근처로 내려왔다가(close>=level) 양봉 마감 (rejection)
-        # - SHORT: MSS active + 레벨 근처로 올라갔다가(close<=level) 음봉 마감 (rejection)
         retest_long_raw = (
             (df["mss_active_up"] == 1)
             & pd.Series(level_up_ffill, index=df.index).notna()
@@ -355,28 +394,15 @@ class TitanStrategy:
             & (df["close"] < df["open"])
         ).fillna(False).astype("int")
 
-        # 리셋 반영: retest가 한 번 발생하면 해당 레벨은 즉시 무효화(다음 MSS까지)
         reset_up = (df["mss_up_trigger"] == 1) | (retest_long_raw == 1)
         reset_down = (df["mss_down_trigger"] == 1) | (retest_short_raw == 1)
 
         seg_up = reset_up.astype(int).cumsum()
         seg_down = reset_down.astype(int).cumsum()
 
-        # 세그먼트 내에서 MSS 트리거 순간 레벨만 유지(ffill), retest 발생 세그먼트에서는 다음 구간으로 넘어가며 레벨이 끊김
-        df["mss_level_up"] = (
-            df["mss_level_up_raw"]
-            .groupby(seg_up)
-            .ffill()
-            .astype(float)
-        )
-        df["mss_level_down"] = (
-            df["mss_level_down_raw"]
-            .groupby(seg_down)
-            .ffill()
-            .astype(float)
-        )
+        df["mss_level_up"] = df["mss_level_up_raw"].groupby(seg_up).ffill().astype(float)
+        df["mss_level_down"] = df["mss_level_down_raw"].groupby(seg_down).ffill().astype(float)
 
-        # 최종 retest: "리셋이 적용된 레벨" 기준으로 계산
         lvl_up = df["mss_level_up"]
         lvl_dn = df["mss_level_down"]
 
@@ -408,10 +434,15 @@ class TitanStrategy:
             "mss_active_up", "mss_active_down",
             "mss_level_up", "mss_level_down",
             "retest_long", "retest_short",
+            "vol_ok_like_prev",
         ]:
             if c in df.columns:
-                # 레벨은 float 유지, 플래그는 int 유지
-                if c in ["pivot_high_price", "pivot_low_price", "last_pivot_high", "last_pivot_low", "mss_level_up", "mss_level_down", "st_val"]:
+                if c in [
+                    "pivot_high_price", "pivot_low_price",
+                    "last_pivot_high", "last_pivot_low",
+                    "mss_level_up", "mss_level_down",
+                    "st_val", "vol_ratio_prev", "vol_score_prev",
+                ]:
                     df[c] = df[c].astype(float)
                 elif c in ["mss_age_up", "mss_age_down"]:
                     df[c] = df[c].astype(float)
@@ -421,6 +452,11 @@ class TitanStrategy:
         return df
 
     def analyze(self, symbol, df):
+        """
+        ✅ Gate에서 volume 제거.
+        - 신호는 구조(MSS+retest) + (daily/ADX/ST)만으로 결정
+        - volume은 신뢰도(score)로만 남김(반환 스펙 유지)
+        """
         if len(df) < 200:
             return None, 0.0, 0.0
 
@@ -431,60 +467,53 @@ class TitanStrategy:
         signal = None
 
         # ---------------------------------------------------------
-        # 1. Multi-Timeframe Filter (옵션화)
+        # 1) Multi-Timeframe Filter (옵션화)
         # ---------------------------------------------------------
         daily_ok = int(curr.get("ema_daily_ok", 0)) == 1
         daily_ema_val = float(curr.get("ema_daily", 0.0)) if daily_ok else 0.0
 
         use_daily = bool(p.get("use_daily_filter", True))
-        use_vol = bool(p.get("use_vol_filter", True))
 
         is_daily_uptrend = (float(curr["close"]) > daily_ema_val) if (use_daily and daily_ok) else True
         is_daily_downtrend = (float(curr["close"]) < daily_ema_val) if (use_daily and daily_ok) else True
-
-        # ✅ Volume 필터: prev 기준으로 완전 통일(보수적/정합성 유리)
-        prev_vol_ma = prev.get("vol_ma", 0.0)
-        if pd.isna(prev_vol_ma) or float(prev_vol_ma) <= 0:
-            prev_vol_ma = 0.0
-
-        is_vol = (float(prev["volume"]) > (float(prev_vol_ma) * float(p["vol_factor"]))) if (use_vol and prev_vol_ma > 0) else True
 
         # (옵션) ADX를 필터로만 유지
         adx_val = curr.get("adx", 0.0)
         if pd.isna(adx_val):
             adx_val = 0.0
         is_trend_alive = float(adx_val) > float(p.get("adx_threshold", 0))
+        adx_filter_on = float(p.get("adx_threshold", 0)) > 0
+
+        # ✅ Volume: 게이트 금지. (로그/스냅샷용)
+        vol_ok_like, vol_ratio, vol_score = self._calc_vol_score(curr, prev, p)
+        # 필요 시 외부에서 curr.get("vol_score_prev")로 신뢰도 활용
 
         # ---------------------------------------------------------
-        # 2. Entry Logic (Rejection Sweep -> MSS -> Retest Pullback)
+        # 2) Entry Logic (Structure Only)
         # ---------------------------------------------------------
         retest_long = int(curr.get("retest_long", 0)) == 1
         retest_short = int(curr.get("retest_short", 0)) == 1
 
-        # MSS 레벨이 살아있는지(스냅샷 기반)
         lvl_up = curr.get("mss_level_up", np.nan)
         lvl_dn = curr.get("mss_level_down", np.nan)
         level_ok = (pd.notna(lvl_up) and float(lvl_up) > 0) or (pd.notna(lvl_dn) and float(lvl_dn) > 0)
 
-        adx_filter_on = float(p.get("adx_threshold", 0)) > 0
-
         if level_ok:
-            if retest_long and is_vol and is_daily_uptrend:
+            if retest_long and is_daily_uptrend:
                 if (not adx_filter_on) or is_trend_alive:
                     signal = "LONG"
-            elif retest_short and is_vol and is_daily_downtrend:
+            elif retest_short and is_daily_downtrend:
                 if (not adx_filter_on) or is_trend_alive:
                     signal = "SHORT"
 
         # ---------------------------------------------------------
-        # 2.5) Safety: ST 방향/가격 위치 불일치 시 신호 차단(진입 품질 보호)
+        # 2.5) Safety: ST 방향/가격 위치 불일치 시 신호 차단
         # ---------------------------------------------------------
         if signal is not None and bool(p.get("use_st_dir_filter", True)):
             st_dir = int(curr.get("st_dir", 0))
             st_val = curr.get("st_val", np.nan)
             close = float(curr["close"])
-            # 일반적으로 st_dir: +1(상승), -1(하락)
-            # LONG이면 상승 추세(ST가 아래)일 때만, SHORT이면 하락 추세(ST가 위)일 때만 허용
+
             if signal == "LONG":
                 if (st_dir <= 0) or (pd.notna(st_val) and float(st_val) >= close):
                     signal = None
@@ -493,7 +522,7 @@ class TitanStrategy:
                     signal = None
 
         # ---------------------------------------------------------
-        # 3. Exit (기존 유지: SuperTrend SL + ATR TP)
+        # 3) Exit (기존 유지: SuperTrend SL + ATR TP)
         # ---------------------------------------------------------
         sl_val = curr.get("st_val", np.nan)
         sl_price = float(sl_val) if (sl_val is not None and not pd.isna(sl_val)) else 0.0

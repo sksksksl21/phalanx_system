@@ -1,0 +1,13 @@
+{
+  "atr_period": 25,
+  "atr_multiplier": 4.5,
+  "adx_threshold": 17,
+  "rsi_upper": 73,
+  "rsi_lower": 30,
+  "vol_factor": 1.0,
+  "ema_intraday": 200,
+  "daily_ema": 10,
+  "swing_len": 5,
+  "context_lookback": 120,
+  "retest_tolerance_atr": 0.3
+}

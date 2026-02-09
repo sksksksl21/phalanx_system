@@ -1,3 +1,15 @@
 {
-  "_comment": "UF config placeholder. Will be replaced by final uf_config schema document."
+  "screening": {
+    "enabled": true,
+    "top_n": 200,
+    "top_k": 30,
+    "score_field": "uf_score",
+    "universe_out": "universe_filter/output/universe.json",
+    "decision_table_out": "universe_filter/output/decision_table.csv",
+    "asof": null
+  },
+  "ohlcv_timeframe": "15m",
+  "ohlcv_lookback_days": 30,
+  "root_config_path": "config.json"
+
 }
