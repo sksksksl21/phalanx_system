@@ -1,0 +1,69 @@
+{
+    "api_key": "aa",
+    "secret_key": "aa",
+
+    "telegram_token": "bb", 
+    "telegram_chat_id": "bb",
+ 
+    
+    
+  "symbol_settings": {
+    "timeframe": "15m",
+    "limit": 250
+  },
+
+  "risk_settings": {
+    "risk_per_trade": 0.03,
+    "max_open_positions": 8,
+    "leverage": 3,
+    "disable_side_exposure_limit": false,
+    "max_side_exposure": 4,
+    "vol_ref_pct": 0.03,
+    "vol_weight_k": 0.1,
+    "vol_weight_min": 0.8,
+    "vol_weight_max": 1.2,
+    "adv_cap_ratio": 0.001,
+    "margin_limit_per_pos": 0.10,
+    "disaster_sl_enabled": true,
+    "disaster_sl_offset_pct": 0.05,
+    "disaster_sl_limit_gap_pct": 0.002,
+    "max_notional_per_pos": 1000
+
+  },
+
+  "strategy_settings": {
+    "blacklist": [
+      "BTC/USDT", "BTC/USDT:USDT", 
+      "ETH/USDT", "ETH/USDT:USDT", 
+      "XAG/USDT", "XAG/USDT:USDT", 
+      "XAU/USDT", "XAU/USDT:USDT", 
+      "我踏马来了/USDT", "我踏马来了/USDT:USDT",
+      "MANTRA/USDT:USDT",  "ROBO/USDT:USDT"
+    ],
+    "major_coins": []
+  },
+
+  "system_settings": {
+    "dashboard_online_sec": 1200,
+    "log_level": "INFO",
+    "use_universe_filter": false,
+    "universe_selected_path": "C:\\Quantops2\\Phalanx_System\\universe_filter\\output\\universe.json",
+    "entry_open_anchor_tolerance": 0.001,
+    "entry_limit_wait_sec": 30,
+    "entry_alpha_atr": 0.0,
+    "loop_buffer_sec": 3.0,
+    "log_heartbeat_to_csv": true,
+    "debug_entry_trace": true,
+
+    "sl_apply_mode": "next",
+    "sl_strategy": "supertrend",
+    "sl_params": {
+      "sl_hit_basis": "close"
+    },
+
+    "time_authority_source": "server",
+    "candle_ts_mode": "open",
+    "min_history_bars_15m": 260
+  }
+  
+}
