@@ -1,0 +1,254 @@
+{
+  "universe": [
+    "SAHARA/USDT:USDT",
+    "ARIA/USDT:USDT",
+    "VVV/USDT:USDT",
+    "BANANAS31/USDT:USDT",
+    "SIREN/USDT:USDT",
+    "SIGN/USDT:USDT",
+    "RESOLV/USDT:USDT",
+    "DEGO/USDT:USDT",
+    "PIPPIN/USDT:USDT",
+    "H/USDT:USDT",
+    "PIXEL/USDT:USDT",
+    "PLUME/USDT:USDT",
+    "POWER/USDT:USDT",
+    "RIVER/USDT:USDT",
+    "PHA/USDT:USDT",
+    "JELLYJELLY/USDT:USDT",
+    "BANANA/USDT:USDT",
+    "FORM/USDT:USDT",
+    "HYPE/USDT:USDT",
+    "TAO/USDT:USDT",
+    "DEGEN/USDT:USDT",
+    "COS/USDT:USDT",
+    "AGLD/USDT:USDT",
+    "LINK/USDT:USDT"
+  ],
+  "meta": {
+    "generated_at_utc": "2026-03-20T10:21:01Z",
+    "days": 30,
+    "top_n": 24,
+    "min_trades": 3,
+    "source_log": "backtest_history.csv",
+    "metric": "pnl_total(EXIT net_pnl)"
+  },
+  "stats": {
+    "SAHARA/USDT:USDT": {
+      "trades": 28,
+      "wins": 24,
+      "losses": 4,
+      "pnl_total": 905.6172000000001,
+      "avg_pnl": 32.34347142857143,
+      "win_rate": 0.8571428571428571,
+      "profit_factor": 12.781505105525472
+    },
+    "ARIA/USDT:USDT": {
+      "trades": 29,
+      "wins": 21,
+      "losses": 8,
+      "pnl_total": 680.5278000000001,
+      "avg_pnl": 23.466475862068968,
+      "win_rate": 0.7241379310344828,
+      "profit_factor": 3.715664213157963
+    },
+    "VVV/USDT:USDT": {
+      "trades": 30,
+      "wins": 24,
+      "losses": 6,
+      "pnl_total": 669.5008000000001,
+      "avg_pnl": 22.316693333333337,
+      "win_rate": 0.8,
+      "profit_factor": 3.690216784200269
+    },
+    "BANANAS31/USDT:USDT": {
+      "trades": 27,
+      "wins": 23,
+      "losses": 4,
+      "pnl_total": 638.2432000000001,
+      "avg_pnl": 23.638637037037043,
+      "win_rate": 0.8518518518518519,
+      "profit_factor": 4.844433267577215
+    },
+    "SIREN/USDT:USDT": {
+      "trades": 23,
+      "wins": 18,
+      "losses": 5,
+      "pnl_total": 598.1925,
+      "avg_pnl": 26.00836956521739,
+      "win_rate": 0.782608695652174,
+      "profit_factor": 2.452881316906971
+    },
+    "SIGN/USDT:USDT": {
+      "trades": 25,
+      "wins": 19,
+      "losses": 6,
+      "pnl_total": 542.5882,
+      "avg_pnl": 21.703528000000002,
+      "win_rate": 0.76,
+      "profit_factor": 4.140795924864693
+    },
+    "RESOLV/USDT:USDT": {
+      "trades": 26,
+      "wins": 20,
+      "losses": 6,
+      "pnl_total": 541.4583,
+      "avg_pnl": 20.82531923076923,
+      "win_rate": 0.7692307692307693,
+      "profit_factor": 4.155687931754961
+    },
+    "DEGO/USDT:USDT": {
+      "trades": 26,
+      "wins": 17,
+      "losses": 9,
+      "pnl_total": 525.472,
+      "avg_pnl": 20.210461538461537,
+      "win_rate": 0.6538461538461539,
+      "profit_factor": 1.8464135763273775
+    },
+    "PIPPIN/USDT:USDT": {
+      "trades": 21,
+      "wins": 16,
+      "losses": 5,
+      "pnl_total": 413.35249999999996,
+      "avg_pnl": 19.683452380952378,
+      "win_rate": 0.7619047619047619,
+      "profit_factor": 2.5144906216463685
+    },
+    "H/USDT:USDT": {
+      "trades": 24,
+      "wins": 17,
+      "losses": 7,
+      "pnl_total": 402.91080000000005,
+      "avg_pnl": 16.787950000000002,
+      "win_rate": 0.7083333333333334,
+      "profit_factor": 2.8561655384394244
+    },
+    "PIXEL/USDT:USDT": {
+      "trades": 24,
+      "wins": 19,
+      "losses": 5,
+      "pnl_total": 376.7725,
+      "avg_pnl": 15.698854166666665,
+      "win_rate": 0.7916666666666666,
+      "profit_factor": 2.479819298047855
+    },
+    "PLUME/USDT:USDT": {
+      "trades": 27,
+      "wins": 21,
+      "losses": 6,
+      "pnl_total": 332.4748000000001,
+      "avg_pnl": 12.313881481481484,
+      "win_rate": 0.7777777777777778,
+      "profit_factor": 2.675506620894572
+    },
+    "POWER/USDT:USDT": {
+      "trades": 16,
+      "wins": 11,
+      "losses": 5,
+      "pnl_total": 327.0383,
+      "avg_pnl": 20.43989375,
+      "win_rate": 0.6875,
+      "profit_factor": 2.357412617976265
+    },
+    "RIVER/USDT:USDT": {
+      "trades": 29,
+      "wins": 21,
+      "losses": 8,
+      "pnl_total": 307.45,
+      "avg_pnl": 10.601724137931035,
+      "win_rate": 0.7241379310344828,
+      "profit_factor": 1.6503240621172117
+    },
+    "PHA/USDT:USDT": {
+      "trades": 24,
+      "wins": 18,
+      "losses": 6,
+      "pnl_total": 284.88950000000006,
+      "avg_pnl": 11.870395833333335,
+      "win_rate": 0.75,
+      "profit_factor": 3.055688926506954
+    },
+    "JELLYJELLY/USDT:USDT": {
+      "trades": 25,
+      "wins": 14,
+      "losses": 11,
+      "pnl_total": 278.8753000000001,
+      "avg_pnl": 11.155012000000005,
+      "win_rate": 0.56,
+      "profit_factor": 1.9145119569337887
+    },
+    "BANANA/USDT:USDT": {
+      "trades": 23,
+      "wins": 18,
+      "losses": 5,
+      "pnl_total": 278.65020000000004,
+      "avg_pnl": 12.115226086956524,
+      "win_rate": 0.782608695652174,
+      "profit_factor": 4.137655897415108
+    },
+    "FORM/USDT:USDT": {
+      "trades": 24,
+      "wins": 17,
+      "losses": 7,
+      "pnl_total": 275.8472,
+      "avg_pnl": 11.493633333333333,
+      "win_rate": 0.7083333333333334,
+      "profit_factor": 2.605315840440985
+    },
+    "HYPE/USDT:USDT": {
+      "trades": 29,
+      "wins": 22,
+      "losses": 7,
+      "pnl_total": 226.88550000000004,
+      "avg_pnl": 7.823637931034484,
+      "win_rate": 0.7586206896551724,
+      "profit_factor": 2.8271711022757744
+    },
+    "TAO/USDT:USDT": {
+      "trades": 30,
+      "wins": 22,
+      "losses": 8,
+      "pnl_total": 200.674,
+      "avg_pnl": 6.689133333333333,
+      "win_rate": 0.7333333333333333,
+      "profit_factor": 2.117825867290695
+    },
+    "DEGEN/USDT:USDT": {
+      "trades": 23,
+      "wins": 18,
+      "losses": 5,
+      "pnl_total": 169.43769999999998,
+      "avg_pnl": 7.3668565217391295,
+      "win_rate": 0.782608695652174,
+      "profit_factor": 2.682725806515685
+    },
+    "COS/USDT:USDT": {
+      "trades": 18,
+      "wins": 13,
+      "losses": 5,
+      "pnl_total": 166.9122,
+      "avg_pnl": 9.2729,
+      "win_rate": 0.7222222222222222,
+      "profit_factor": 1.4695966153252302
+    },
+    "AGLD/USDT:USDT": {
+      "trades": 29,
+      "wins": 22,
+      "losses": 7,
+      "pnl_total": 126.44490000000005,
+      "avg_pnl": 4.360168965517243,
+      "win_rate": 0.7586206896551724,
+      "profit_factor": 1.6103389653794247
+    },
+    "LINK/USDT:USDT": {
+      "trades": 27,
+      "wins": 19,
+      "losses": 8,
+      "pnl_total": 125.29179999999997,
+      "avg_pnl": 4.640437037037036,
+      "win_rate": 0.7037037037037037,
+      "profit_factor": 1.9726748212117542
+    }
+  }
+}

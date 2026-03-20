@@ -1429,17 +1429,14 @@ class LiveEngine:
             if not s:
                 return s
 
-            # 이미 선물 표준
             if ":USDT" in s:
                 return s
 
-            # 'BTC/USDT' 형태
             if "/" in s:
                 if s.endswith("/USDT"):
                     return s + ":USDT"
                 return s
 
-            # 'BTCUSDT' 형태 최소 처리
             if s.endswith("USDT") and len(s) > 4:
                 base = s[:-4]
                 return f"{base}/USDT:USDT"
@@ -1470,7 +1467,6 @@ class LiveEngine:
                             cand = v
                             break
 
-                # normalize + dedup (order-preserving)
                 cand = [str(x).strip() for x in (cand or []) if str(x).strip()]
                 cand = list(dict.fromkeys(cand))
 
@@ -1531,38 +1527,61 @@ class LiveEngine:
         except Exception:
             pass
 
-        raw_map = self.executor.prepare_data(filtered) or {}
+        min_len = int(self._t9_min_len())
 
-        # ✅ raw_map 키도 canon으로 정규화해서 validated_map에 적재
-        validated_map = {}
-        for sym, df in raw_map.items():
-            sym_c = _canon(sym)
+        # -------------------------------------------------
+        # ✅ Initial seed once / incremental refresh afterwards
+        # -------------------------------------------------
+        prep_mode = "incremental" if bool(getattr(self, "raw_data_map", {}) or {}) else "full_seed"
 
-            v = DataLoader.validate_and_format(df)
-            if v is None:
-                logger.warning(f"⚠️ DATA_DROP | {sym_c} validate failed")
-                continue
+        if prep_mode == "full_seed":
+            raw_map = self.executor.prepare_data(filtered) or {}
 
-            v = v.copy()
-            v["datetime"] = pd.to_datetime(v["timestamp"], unit="ms", errors="coerce")
-            v = v.dropna(subset=["datetime"]).set_index("datetime")
-            if v.empty:
-                continue
+            validated_map = {}
+            for sym, df in raw_map.items():
+                sym_c = _canon(sym)
 
-            if sym_c in validated_map:
-                try:
-                    if len(v) > len(validated_map[sym_c]):
+                v = DataLoader.validate_and_format(df)
+                if v is None:
+                    logger.warning(f"⚠️ DATA_DROP | {sym_c} validate failed")
+                    continue
+
+                v = v.copy()
+                v["datetime"] = pd.to_datetime(v["timestamp"], unit="ms", errors="coerce")
+                v = v.dropna(subset=["datetime"]).set_index("datetime")
+                if v.empty:
+                    continue
+
+                if sym_c in validated_map:
+                    try:
+                        if len(v) > len(validated_map[sym_c]):
+                            validated_map[sym_c] = v
+                    except Exception:
                         validated_map[sym_c] = v
-                except Exception:
+                else:
                     validated_map[sym_c] = v
-            else:
-                validated_map[sym_c] = v
+        else:
+            validated_map = self._refresh_raw_data_incremental_15m(filtered, min_bars=min_len)
 
         # ✅ Titan9 최소 길이 보장(200+)을 위해 15m 히스토리 보강
-        min_len = int(self._t9_min_len())
         validated_map = self._ensure_min_history_15m(validated_map, min_bars=min_len)
 
-        self.raw_data_map = {k: validated_map[k] for k in sorted(validated_map.keys())}
+        self.raw_data_map = {
+            k: validated_map[k]
+            for k in sorted(validated_map.keys())
+            if isinstance(validated_map.get(k), pd.DataFrame) and not validated_map.get(k).empty
+        }
+
+        if not self.raw_data_map:
+            logger.error("❌ DATA_PREP_EMPTY | no validated 15m raw data")
+            self.raw_daily_map = {}
+            self.data_map = {}
+            self.symbols = []
+            return
+
+        logger.info(
+            f"📦 DATA_PREP_MODE | mode={prep_mode} req={len(filtered)} raw={len(self.raw_data_map)}"
+        )
 
         # ✅ DAILY EMA용 1d 컨텍스트는 UTC day cache 사용
         try:
@@ -1580,7 +1599,6 @@ class LiveEngine:
         except Exception as e:
             logger.error(f"[prepare_data] align_data_map_common_timeline failed: {e}")
 
-        # ✅ symbols는 data_map(=ready) 키 기준(표준키)
         self.symbols = sorted(self.data_map.keys())
         logger.info(f"📊 INDICATORS_READY | symbols={self.symbols}")
         logger.info(
@@ -1589,18 +1607,45 @@ class LiveEngine:
         )
 
 
+    def _calc_live_history_target_15m(self, min_bars: int) -> int:
+        """
+        LIVE 15m raw cache 유지 길이 계산.
+        - DAILY EMA는 1d context cache가 권위이므로 여기서는 intraday warmup만 책임진다.
+        """
+        try:
+            p = getattr(self.titan, "params", None)
+            p = p if isinstance(p, dict) else {}
+        except Exception:
+            p = {}
+
+        try:
+            ema_intra_len = int(p.get("ema_intraday", 200) or 200)
+        except Exception:
+            ema_intra_len = 200
+
+        try:
+            atr_len = int(p.get("atr_period", 14) or 14)
+        except Exception:
+            atr_len = 14
+
+        want = int(min_bars or 0)
+        want = max(want, 200)               # Titan analyze 계약
+        want = max(want, ema_intra_len + 5) # EMA warmup
+        want = max(want, atr_len + 5)       # ATR warmup
+        want = max(want, 600)               # 실전 여유
+        return int(want + 50)               # merge/정렬 여유
 
     def _ensure_min_history_15m(self, validated_map: dict, min_bars: int) -> dict:
         """
         ✅ LIVE에서 전략 입력용 15m 히스토리를 보강 로드
-        - executor.prepare_data()가 짧게 가져오는 경우 exchange.fetch_ohlcv로 추가 확보
+        - executor.prepare_data()/incremental refresh가 짧게 가져오는 경우 exchange.fetch_ohlcv로 추가 확보
         - 실패하면 기존 validated_map 유지
 
         정합 강화:
-        - 15m intraday 지표 웜업 목적의 최소 히스토리만 보장
-        - DAILY EMA는 1D 캐시(raw_daily_map)에서 별도 주입되므로
-        15m 기준 40일치(40*96봉) 강제는 제거
-        - 단일 fetch(limit=want)의 거래소 제한을 피하기 위해 pagination으로 누적 fetch
+        - 15m intraday 지표 warmup만 책임진다.
+        - DAILY EMA는 엔진이 raw_daily_map(1d context)에서 별도 계산/주입하므로
+        여기서 15m 기준 40일치(=3890행)를 강제하지 않는다.
+        - pagination으로 누적 fetch한다.
         """
         out = dict(validated_map or {})
 
@@ -1609,28 +1654,10 @@ class LiveEngine:
             if ex is None or not hasattr(ex, "fetch_ohlcv"):
                 return out
 
-            # -------------------------------------------------
-            # 1) 전략 요구량 계산
-            # -------------------------------------------------
-            try:
-                p = getattr(self.titan, "params", None)
-                p = p if isinstance(p, dict) else {}
-            except Exception:
-                p = {}
-
-            # ✅ intraday warmup만 보장
-            # - min_bars: 엔진 호출부 요구치
-            # - 600봉: EMA/ATR/ST/ADX 등 15m 지표 안정화용 하한
-            want = int(min_bars or 0)
-            want = max(want, 600)
-            want = want + 50  # 여유분(누락/정렬/지표계산)
-
+            want = int(self._calc_live_history_target_15m(min_bars))
             tf_ms = int(self.tf15_sec * 1000)
-            batch_limit = 1500  # Binance/CCXT 일반 제한 대응
+            batch_limit = 1500
 
-            # -------------------------------------------------
-            # 2) 심볼별 보강 fetch
-            # -------------------------------------------------
             for sym, df in list(out.items()):
                 try:
                     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -1638,13 +1665,11 @@ class LiveEngine:
                     if len(df) >= want:
                         continue
 
-                    # 현재 시점 기준으로 충분히 과거부터 pagination 시작
                     try:
                         now_ms = int(self._server_now_ms())
                     except Exception:
                         now_ms = int(time.time() * 1000)
 
-                    # batch_limit만큼 앞 여유를 더 둬서 첫 페이지 누락 방지
                     since = max(0, int(now_ms - ((want + batch_limit + 8) * tf_ms)))
 
                     rows = []
@@ -1660,7 +1685,6 @@ class LiveEngine:
                         if not batch:
                             break
 
-                        # 중복 방지 (거래소가 since 포함/중복 반환하는 경우 방어)
                         if rows:
                             last_ts = int(rows[-1][0])
                             batch = [r for r in batch if int(r[0]) > last_ts]
@@ -1670,15 +1694,12 @@ class LiveEngine:
 
                         rows.extend(batch)
 
-                        # 충분히 확보되었고 최신 구간까지 왔으면 종료
                         last_batch_ts = int(batch[-1][0])
                         if len(rows) >= want and (now_ms - last_batch_ts) <= (2 * tf_ms):
                             break
 
-                        # 다음 페이지
                         cursor = int(last_batch_ts + tf_ms)
 
-                        # 마지막 페이지면 종료
                         if len(batch) < batch_limit:
                             break
 
@@ -1690,7 +1711,6 @@ class LiveEngine:
                         columns=["timestamp", "open", "high", "low", "close", "volume"]
                     )
 
-                    # 중복/정렬 방어
                     tmp = tmp.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
                     tmp = tmp.tail(want)
 
@@ -1713,7 +1733,6 @@ class LiveEngine:
             return out
 
         return out
-
     # -----------------------------------------------------
     # Time / Loop Authority
     # -----------------------------------------------------
@@ -1808,6 +1827,148 @@ class LiveEngine:
 
         out = [r for r in out if int(r[0]) < int(until_ms)]
         return out
+
+    def _refresh_raw_data_incremental_15m(self, symbols, min_bars: int) -> dict:
+        """
+        ✅ 15m raw_data_map 증분 갱신
+        - 기존 raw_data_map이 있으면 마지막 timestamp 이후만 fetch
+        - 신규 심볼은 intraday target 길이만큼 seed fetch
+        - 결과는 timestamp dedupe/sort 후 tail keep
+        - 출력은 raw_data_map 계약과 동일한 형태(datetime index + timestamp/open/high/low/close/volume)
+        """
+        try:
+            req = [str(s).strip() for s in (symbols or []) if str(s).strip()]
+            req = list(dict.fromkeys(req))
+        except Exception:
+            req = []
+
+        if not req:
+            return {}
+
+        existing = dict(getattr(self, "raw_data_map", {}) or {})
+        out = {}
+
+        keep_bars = int(self._calc_live_history_target_15m(min_bars))
+        tf_ms = int(self.tf15_sec * 1000)
+
+        try:
+            now_ms = int(self._server_now_ms())
+        except Exception:
+            now_ms = int(time.time() * 1000)
+
+        # 현재 진행 중인 15m 봉까지 반영 가능하도록 한 봉 여유
+        fetch_until = int(now_ms + tf_ms)
+
+        try:
+            ss = (self.cfg.get("system_settings", {}) or {})
+            universe_min_bars = int(ss.get("min_history_bars_15m", 260) or 260)
+            if universe_min_bars < 200:
+                universe_min_bars = 200
+        except Exception:
+            universe_min_bars = 260
+
+        pos_syms = set((self.executor.positions or {}).keys())
+        cols = ["timestamp", "open", "high", "low", "close", "volume"]
+
+        def _coerce_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return pd.DataFrame(columns=cols)
+
+            tmp = df.copy()
+
+            if "timestamp" not in tmp.columns:
+                try:
+                    idx = pd.to_datetime(tmp.index, errors="coerce")
+                    tmp["timestamp"] = (idx.view("int64") // 10**6)
+                except Exception:
+                    return pd.DataFrame(columns=cols)
+
+            miss = [c for c in cols if c not in tmp.columns]
+            if miss:
+                return pd.DataFrame(columns=cols)
+
+            tmp = tmp[cols].copy()
+            tmp["timestamp"] = pd.to_numeric(tmp["timestamp"], errors="coerce")
+            tmp = tmp.dropna(subset=["timestamp"])
+            if tmp.empty:
+                return pd.DataFrame(columns=cols)
+
+            try:
+                tmp["timestamp"] = tmp["timestamp"].astype("int64")
+            except Exception:
+                return pd.DataFrame(columns=cols)
+
+            return tmp
+
+        for sym in req:
+            try:
+                prev = _coerce_ohlcv_frame(existing.get(sym))
+                if not prev.empty:
+                    last_ts = int(prev["timestamp"].iloc[-1])
+                    since_ms = max(0, int(last_ts + 1))
+                else:
+                    seed_bars = int(keep_bars + 8)
+                    since_ms = max(0, int(fetch_until - (seed_bars * tf_ms)))
+
+                rows = []
+                if since_ms < fetch_until:
+                    rows = self._fetch_ohlcv_range(
+                        sym=sym,
+                        timeframe="15m",
+                        since_ms=int(since_ms),
+                        until_ms=int(fetch_until),
+                        limit=1500,
+                    ) or []
+
+                if rows:
+                    add = pd.DataFrame(rows, columns=cols)
+                    merged = pd.concat([prev, add], ignore_index=True) if not prev.empty else add
+                else:
+                    merged = prev
+
+                if merged is None or merged.empty:
+                    continue
+
+                merged = (
+                    merged
+                    .drop_duplicates(subset=["timestamp"], keep="last")
+                    .sort_values("timestamp")
+                    .tail(keep_bars)
+                    .reset_index(drop=True)
+                )
+
+                # 신규 상장/히스토리 짧은 심볼은 기존 prepare_data 정책 유지
+                if len(merged) < int(universe_min_bars) and sym not in pos_syms:
+                    logger.warning(
+                        f"⚠️ DATA_DROP_SHORT | {sym} bars={len(merged)} < min_bars={universe_min_bars} "
+                        f"(incremental refresh) -> drop from universe"
+                    )
+                    continue
+
+                valid = DataLoader.validate_and_format(merged)
+                if valid is None or valid.empty:
+                    continue
+
+                valid = valid.copy()
+                valid["datetime"] = pd.to_datetime(valid["timestamp"], unit="ms", errors="coerce")
+                valid = valid.dropna(subset=["datetime"]).set_index("datetime")
+                if valid.empty:
+                    continue
+
+                out[sym] = valid
+
+            except Exception as e:
+                logger.warning(f"⚠️ DATA_REFRESH_FAIL | {sym} | {type(e).__name__}: {e}")
+                prev_df = existing.get(sym)
+                if isinstance(prev_df, pd.DataFrame) and not prev_df.empty:
+                    out[sym] = prev_df.copy()
+
+        logger.info(
+            f"🔁 DATA_REFRESH_15M | mode=incremental req={len(req)} kept={len(out)} keep_bars={keep_bars}"
+        )
+        return out
+
+
 
     def _ensure_daily_context_cached_utc(self, symbols):
         """
@@ -2037,7 +2198,7 @@ class LiveEngine:
         except Exception:
             daily_len = 25
 
-        need_days = int(max(100, daily_len * 4))
+        need_days = int(max(40, daily_len + 5))
         loaded = 0
 
         stats = {
@@ -2063,7 +2224,7 @@ class LiveEngine:
                     continue
 
                 end_dt = pd.Timestamp(df15.index.max()).normalize() + pd.Timedelta(days=1)
-                since_dt = end_dt - pd.Timedelta(days=int(need_days + 30))
+                since_dt = end_dt - pd.Timedelta(days=int(need_days + 5))
 
                 since_ms = int(pd.Timestamp(since_dt).timestamp() * 1000)
                 until_ms = int(pd.Timestamp(end_dt).timestamp() * 1000)
@@ -2150,7 +2311,7 @@ class LiveEngine:
         except Exception:
             daily_len = 25
 
-        need_days = int(max(100, daily_len * 4))
+        need_days = int(max(40, daily_len + 5))
 
         dfd = getattr(self, "raw_daily_map", {}).get(sym)
         if dfd is None or dfd.empty:
@@ -3263,12 +3424,10 @@ class LiveEngine:
     # - placement: right after def _diagnose_retest(...)
     # -----------------------------------------------------
     def _debug_analyze_result(self, sym: str, past_data: pd.DataFrame,
-                            signal, sl, tp,
-                            max_samples: int = 2):
+                              signal, sl, tp,
+                              max_samples: int = 2):
         """
-        ✅ Titan 8.2.1-LiquidityMSSPullback-VolScoreOnly 기준 최종 반환값 디버그
-        - continuation/pullback 잔재 제거
-        - MSS / retest / volume-score / daily / ST 기준으로 스냅샷 출력
+        ✅ continuation pullback 전략 기준 최종 반환값 디버그
         """
         try:
             dbg_cnt = getattr(self, "_analyze_dbg_count", 0)
@@ -3297,7 +3456,6 @@ class LiveEngine:
                 return None
 
         snapshot = {
-            # price / base indicators
             "close": _f(curr.get("close")),
             "high": _f(curr.get("high")),
             "low": _f(curr.get("low")),
@@ -3305,30 +3463,14 @@ class LiveEngine:
             "adx": _f(curr.get("adx")),
             "ema_intra": _f(curr.get("ema_intra")),
             "ema_daily": _f(curr.get("ema_daily")),
-            "ema_daily_ok": _i(curr.get("ema_daily_ok")),
             "st_dir": _i(curr.get("st_dir")),
             "st_val": _f(curr.get("st_val")),
-
-            # volume score only
-            "vol_ratio_prev": _f(curr.get("vol_ratio_prev")),
-            "vol_score_prev": _f(curr.get("vol_score_prev")),
-            "vol_ok_like_prev": _i(curr.get("vol_ok_like_prev")),
-
-            # liquidity / MSS / retest
-            "sweep_high": _i(curr.get("sweep_high")),
-            "sweep_low": _i(curr.get("sweep_low")),
-            "recent_sweep_high": _i(curr.get("recent_sweep_high")),
-            "recent_sweep_low": _i(curr.get("recent_sweep_low")),
-            "mss_up_trigger": _i(curr.get("mss_up_trigger")),
-            "mss_down_trigger": _i(curr.get("mss_down_trigger")),
-            "mss_age_up": _f(curr.get("mss_age_up")),
-            "mss_age_down": _f(curr.get("mss_age_down")),
-            "mss_active_up": _i(curr.get("mss_active_up")),
-            "mss_active_down": _i(curr.get("mss_active_down")),
-            "mss_level_up": _f(curr.get("mss_level_up")),
-            "mss_level_down": _f(curr.get("mss_level_down")),
-            "retest_long": _i(curr.get("retest_long")),
-            "retest_short": _i(curr.get("retest_short")),
+            "trend_up": _i(curr.get("trend_up")),
+            "trend_down": _i(curr.get("trend_down")),
+            "pullback_long_recent": _i(curr.get("pullback_long_recent")),
+            "pullback_short_recent": _i(curr.get("pullback_short_recent")),
+            "continuation_long": _i(curr.get("continuation_long")),
+            "continuation_short": _i(curr.get("continuation_short")),
         }
 
         logger.info(
@@ -3346,6 +3488,7 @@ class LiveEngine:
 
 
 
+
     # =========================================================
     # [MOD] _compute_candidates_15m() 내부 교체 패치
     # - "idx/get_loc + iloc[:idx+1] + _slice_for_strategy" 제거
@@ -3353,9 +3496,9 @@ class LiveEngine:
     # =========================================================
     def _compute_candidates_15m(self, current_time_15m, symbols=None):
         """
-        ✅ Titan 8.2.1-LiquidityMSSPullback-VolScoreOnly 기준 후보 계산
-        - analyze()는 MSS + retest + daily/ADX/ST 를 그대로 사용
-        - 후보 우선순위(score)는 adx가 아니라 vol_score_prev 사용
+        ✅ continuation pullback 전략 기준 후보 계산
+        - 추가 데이터 fetch 없음
+        - TitanStrategy.analyze() 반환값을 그대로 사용
         - debug_entry_trace 시 strategy-aligned gate trace 출력
         """
 
@@ -3437,21 +3580,12 @@ class LiveEngine:
                     "ema_daily_ok": _i(curr.get("ema_daily_ok"), None),
                     "st_dir": _i(curr.get("st_dir"), None),
                     "st_val": _f(curr.get("st_val"), None),
-
-                    "vol_ratio_prev": _f(curr.get("vol_ratio_prev"), None),
-                    "vol_score_prev": _f(curr.get("vol_score_prev"), None),
-                    "vol_ok_like_prev": _i(curr.get("vol_ok_like_prev"), None),
-
-                    "recent_sweep_high": _i(curr.get("recent_sweep_high"), None),
-                    "recent_sweep_low": _i(curr.get("recent_sweep_low"), None),
-                    "mss_up_trigger": _i(curr.get("mss_up_trigger"), None),
-                    "mss_down_trigger": _i(curr.get("mss_down_trigger"), None),
-                    "mss_active_up": _i(curr.get("mss_active_up"), None),
-                    "mss_active_down": _i(curr.get("mss_active_down"), None),
-                    "mss_level_up": _f(curr.get("mss_level_up"), None),
-                    "mss_level_down": _f(curr.get("mss_level_down"), None),
-                    "retest_long": _i(curr.get("retest_long"), None),
-                    "retest_short": _i(curr.get("retest_short"), None),
+                    "trend_up": _i(curr.get("trend_up"), None),
+                    "trend_down": _i(curr.get("trend_down"), None),
+                    "pullback_long_recent": _i(curr.get("pullback_long_recent"), None),
+                    "pullback_short_recent": _i(curr.get("pullback_short_recent"), None),
+                    "continuation_long": _i(curr.get("continuation_long"), None),
+                    "continuation_short": _i(curr.get("continuation_short"), None),
                 }
             except Exception:
                 return {}
@@ -3460,56 +3594,50 @@ class LiveEngine:
             try:
                 p = getattr(self.titan, "params", {}) or {}
 
-                close = _f(curr.get("close"), 0.0)
-                adx = _f(curr.get("adx"), 0.0)
+                close = float(curr.get("close", 0.0) or 0.0)
+                ema_daily_ok = int(curr.get("ema_daily_ok", 0) or 0) == 1
                 ema_daily = _f(curr.get("ema_daily"), None)
-                ema_daily_ok = (_i(curr.get("ema_daily_ok"), 0) == 1)
+                adx = float(curr.get("adx", 0.0) or 0.0)
 
-                use_daily = bool(p.get("use_daily_filter", True))
-                adx_threshold = float(p.get("adx_threshold", 0) or 0)
-                adx_filter_on = adx_threshold > 0
+                daily_up = bool(ema_daily_ok and (ema_daily is not None) and (close > ema_daily))
+                daily_dn = bool(ema_daily_ok and (ema_daily is not None) and (close < ema_daily))
+                adx_ok = bool(adx > float(p.get("adx_threshold", 0) or 0))
 
-                daily_up = (close > ema_daily) if (use_daily and ema_daily_ok and ema_daily is not None) else True
-                daily_dn = (close < ema_daily) if (use_daily and ema_daily_ok and ema_daily is not None) else True
-                adx_ok = (adx > adx_threshold) if adx_filter_on else True
-
-                retest_long = (_i(curr.get("retest_long"), 0) == 1)
-                retest_short = (_i(curr.get("retest_short"), 0) == 1)
-
-                lvl_up = _f(curr.get("mss_level_up"), None)
-                lvl_dn = _f(curr.get("mss_level_down"), None)
-                level_ok = ((lvl_up is not None and lvl_up > 0) or (lvl_dn is not None and lvl_dn > 0))
+                trend_up = int(curr.get("trend_up", 0) or 0) == 1
+                trend_down = int(curr.get("trend_down", 0) or 0) == 1
+                pb_long = int(curr.get("pullback_long_recent", 0) or 0) == 1
+                pb_short = int(curr.get("pullback_short_recent", 0) or 0) == 1
+                cont_long = int(curr.get("continuation_long", 0) or 0) == 1
+                cont_short = int(curr.get("continuation_short", 0) or 0) == 1
 
                 pre_sig = None
-                if level_ok:
-                    if retest_long and daily_up and adx_ok:
-                        pre_sig = "LONG"
-                    elif retest_short and daily_dn and adx_ok:
-                        pre_sig = "SHORT"
+                if trend_up and pb_long and cont_long and daily_up and adx_ok:
+                    pre_sig = "LONG"
+                elif trend_down and pb_short and cont_short and daily_dn and adx_ok:
+                    pre_sig = "SHORT"
 
                 post_sig = pre_sig
-                if pre_sig is not None and bool(p.get("use_st_dir_filter", True)):
-                    st_dir = _i(curr.get("st_dir"), 0)
+                if pre_sig is not None:
+                    st_dir = int(curr.get("st_dir", 0) or 0)
                     st_val = _f(curr.get("st_val"), None)
 
                     if pre_sig == "LONG":
-                        if (st_dir is None or st_dir <= 0) or (st_val is not None and st_val >= close):
+                        if (st_dir <= 0) or (st_val is not None and st_val >= close):
                             post_sig = None
                     else:
-                        if (st_dir is None or st_dir >= 0) or (st_val is not None and st_val <= close):
+                        if (st_dir >= 0) or (st_val is not None and st_val <= close):
                             post_sig = None
 
                 return {
-                    "daily_up": int(bool(daily_up)),
-                    "daily_dn": int(bool(daily_dn)),
-                    "adx_ok": int(bool(adx_ok)),
-                    "level_ok": int(bool(level_ok)),
-                    "retest_long": int(bool(retest_long)),
-                    "retest_short": int(bool(retest_short)),
-                    "mss_up": int(_i(curr.get("mss_up_trigger"), 0) == 1),
-                    "mss_dn": int(_i(curr.get("mss_down_trigger"), 0) == 1),
-                    "vol_ok_like": int(_i(curr.get("vol_ok_like_prev"), 0) == 1),
-                    "vol_score": _f(curr.get("vol_score_prev"), 0.0),
+                    "daily_up": int(daily_up),
+                    "daily_dn": int(daily_dn),
+                    "adx_ok": int(adx_ok),
+                    "trend_up": int(trend_up),
+                    "trend_down": int(trend_down),
+                    "pbL": int(pb_long),
+                    "pbS": int(pb_short),
+                    "contL": int(cont_long),
+                    "contS": int(cont_short),
                     "pre_sig": pre_sig,
                     "post_sig": post_sig,
                 }
@@ -3581,8 +3709,8 @@ class LiveEngine:
                 continue
 
             try:
-                score = curr_row.get("vol_score_prev", 0.0)
-                score = float(score) if score is not None and math.isfinite(float(score)) else 0.0
+                score = curr_row.get("adx", 0)
+                score = float(score) if score is not None else 0.0
             except Exception:
                 score = 0.0
 
@@ -3596,19 +3724,7 @@ class LiveEngine:
             })
 
             try:
-                vol_ratio = curr_row.get("vol_ratio_prev", None)
-                vol_ratio = float(vol_ratio) if vol_ratio is not None and math.isfinite(float(vol_ratio)) else None
-
-                if vol_ratio is None:
-                    logger.info(
-                        f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} "
-                        f"vol_score={score:.4f} sl={sl} tp={tp}"
-                    )
-                else:
-                    logger.info(
-                        f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} "
-                        f"vol_score={score:.4f} vol_ratio={vol_ratio:.4f} sl={sl} tp={tp}"
-                    )
+                logger.info(f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} adx={score:.2f} sl={sl} tp={tp}")
             except Exception:
                 logger.info(f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} sl={sl} tp={tp}")
 
@@ -3622,6 +3738,7 @@ class LiveEngine:
             )
 
         return candidates
+
 
 
 
@@ -4686,14 +4803,20 @@ class LiveEngine:
     def _manage_positions_live(self, authority_time, active_symbols, realtime_snapshot: dict = None):
         """
         ✅ Backtest-aligned Manage Loop
+        - 관리 대상은 '실제 보유 포지션'만 사용한다.
         - 관리 기준 row 권위는 15m data_map
-        - 다만 선택된 현재 15m row의 high/low/close는 1m 확정봉으로 보강
+        - 선택된 현재 15m row의 high/low/close는 1m 확정봉으로 보강
         - realtime_snapshot은 MTM 보조용일 뿐, SL/EXIT 권위로 사용하지 않음
+
         반환:
         current_prices(dict), exit_ct(int), upd_ct(int), manage_cnt(int)
         """
-        pos_keys = (self.executor.positions or {}).keys()
-        manage_syms = set(active_symbols or []) | set(pos_keys)
+        pos_keys = list((self.executor.positions or {}).keys())
+
+        # ✅ 핵심 수정:
+        # active_symbols(유니버스 전체)는 관리 대상이 아니다.
+        # intrabar 1m 준비 및 관리 루프는 실제 보유 포지션만 돈다.
+        manage_syms = sorted(set(pos_keys))
         manage_cnt = int(len(manage_syms))
 
         current_prices = {}
@@ -4709,16 +4832,19 @@ class LiveEngine:
             except Exception:
                 return default
 
-        # ✅ 핵심: manage 직전 1m intrabar 준비
-        # 보유 포지션에 대해서만 1m intrabar를 준비한다.
-        intrabar_prep_syms = sorted(set(pos_keys))
+        # ✅ manage 직전 1m intrabar 준비: 포지션 보유 심볼만
         try:
-            if intrabar_prep_syms:
+            if manage_syms:
                 self._prepare_intrabar_1m_live(
-                    symbols=intrabar_prep_syms,
+                    symbols=manage_syms,
                     authority_time=authority_time,
                     lookback_bars=4,
                 )
+            else:
+                # 포지션 없으면 이전 캐시 오염 방지
+                self.raw_1m_map = {}
+                self.data_1m_map = {}
+                self._intrabar_1m_ready_key = None
         except Exception as e:
             logger.error(f"LIVE_INTRABAR_PREP_FAIL | {type(e).__name__}: {e}")
 
@@ -4741,32 +4867,34 @@ class LiveEngine:
                     # ✅ 기존 active SL 바깥에 재난 SL 유지
                     try:
                         pos_now = (self.executor.positions or {}).get(sym)
-                        if isinstance(pos_now, dict):
-                            rsn = "UPDATE_SL" if act == "UPDATE_SL" else "MANAGE_LOOP"
-                            self._sync_disaster_position_sl(
-                                sym=sym,
-                                pos=pos_now,
-                                active_sl=pos_now.get("sl"),
-                                reason=rsn,
-                            )
-                    except Exception:
-                        pass
+                        if pos_now:
+                            rt_px = None
+                            try:
+                                if isinstance(realtime_snapshot, dict):
+                                    snap = realtime_snapshot.get(sym) or {}
+                                    rt_px = _sf(snap.get("last", None), None)
+                            except Exception:
+                                rt_px = None
+
+                            disaster_px = rt_px if rt_px is not None else current_prices.get(sym)
+                            if disaster_px is not None:
+                                self._maintain_disaster_sl_live(sym, pos_now, float(disaster_px))
+                    except Exception as e:
+                        logger.error(f"DISASTER_SL_MAINTAIN_FAIL | {sym} | {type(e).__name__}: {e}")
 
                     if act == "EXIT":
                         exit_ct += 1
                     elif act == "UPDATE_SL":
                         upd_ct += 1
-                continue
 
-            # ---- 2) row가 없으면: SL 판단은 스킵
-            # 포지션이 있는 경우에만 MTM 가격을 ticker로 보강
-            if sym in (self.executor.positions or {}):
+            else:
+                # row가 없더라도 MTM용 realtime last는 보유 포지션에 한해 사용 가능
                 try:
-                    if hasattr(self.executor, "fetch_ticker"):
-                        t = self.executor.fetch_ticker(sym) or {}
-                        last = _sf((t or {}).get("last", None), None)
-                        if last is not None:
-                            current_prices[sym] = float(last)
+                    if sym in (self.executor.positions or {}) and isinstance(realtime_snapshot, dict):
+                        snap = realtime_snapshot.get(sym) or {}
+                        rt_last = _sf(snap.get("last", None), None)
+                        if rt_last is not None:
+                            current_prices[sym] = float(rt_last)
                 except Exception:
                     pass
 

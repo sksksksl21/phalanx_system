@@ -1127,6 +1127,7 @@ class BinanceExecutor:
             except Exception:
                 req["algoId"] = str(order_id)
 
+            # 1) ccxt raw method 우선
             for mname in (
                 "fapiPrivateDeleteAlgoOrder",
                 "fapiPrivate_delete_algoorder",
@@ -1143,6 +1144,7 @@ class BinanceExecutor:
                             return True
                     return True
 
+            # 2) raw method이 없으면 direct request fallback
             if hasattr(self.exchange, "request"):
                 resp = self.exchange.request("algoOrder", "fapiPrivate", "DELETE", req)
                 if isinstance(resp, dict):
@@ -1168,7 +1170,7 @@ class BinanceExecutor:
                     return False
             return False
 
-    def ensure_disaster_sl_limit_mark(
+    def ensure_position_sl_limit_mark(
         self,
         symbol: str,
         position_side: str,
@@ -1180,9 +1182,9 @@ class BinanceExecutor:
         trigger: str = "MARK_PRICE",
     ) -> dict:
         """
-        ✅ 거래소 재난 SL
+        ✅ 거래소 Position SL 미러링
         - Stop-Limit + Mark trigger
-        - Algo endpoint(/fapi/v1/algoOrder)만 사용
+        - Binance USDⓈ-M 조건주문은 Algo endpoint(/fapi/v1/algoOrder)만 사용
         - 성공 시 {"order_id": str, "is_algo": bool}
         - 실패 시 {"order_id":"", "is_algo":False}
         """
@@ -1233,7 +1235,7 @@ class BinanceExecutor:
 
         side_binance = "SELL" if ps == "LONG" else "BUY"
 
-        # ✅ 기존 재난 SL 선취소
+        # ✅ 기존 조건주문 선취소 (충돌 회피)
         if prev_order_id:
             try:
                 self._cancel_conditional_order_safe(symbol, str(prev_order_id), bool(prev_is_algo))
@@ -1242,6 +1244,9 @@ class BinanceExecutor:
 
         def _create_algo_once() -> dict:
             market_id = _to_market_id(symbol)
+
+            # Binance New Algo Order docs:
+            # algoType=CONDITIONAL, type=STOP, triggerPrice, workingType, price, quantity
             req = self._signed_params({
                 "algoType": "CONDITIONAL",
                 "symbol": market_id,
@@ -1256,6 +1261,7 @@ class BinanceExecutor:
                 "newOrderRespType": "RESULT",
             })
 
+            # 1) ccxt raw method 우선
             for mname in (
                 "fapiPrivatePostAlgoOrder",
                 "fapiPrivate_post_algoorder",
@@ -1269,6 +1275,7 @@ class BinanceExecutor:
                     if oid:
                         return {"order_id": oid, "is_algo": True}
 
+            # 2) raw method이 없거나 응답 파싱 실패면 direct request fallback
             if hasattr(self.exchange, "request"):
                 resp = self.exchange.request("algoOrder", "fapiPrivate", "POST", req)
                 oid = _extract_algo_id(resp)
@@ -1278,11 +1285,12 @@ class BinanceExecutor:
             return {"order_id": "", "is_algo": False}
 
         try:
+            # ✅ 일반 STOP fallback 금지 (-4120 유발)
             out = _create_algo_once()
             if out.get("order_id"):
                 return out
 
-            logger.error(f"Disaster SL create failed {symbol}: algoOrder returned empty response")
+            logger.error(f"Position SL create failed {symbol}: algoOrder returned empty response")
             return {"order_id": "", "is_algo": False}
 
         except Exception as e:
@@ -1296,14 +1304,15 @@ class BinanceExecutor:
                     out = _create_algo_once()
                     if out.get("order_id"):
                         return out
-                    logger.error(f"Disaster SL create failed {symbol}: algoOrder returned empty response after retry")
+                    logger.error(f"Position SL create failed {symbol}: algoOrder returned empty response after retry")
                     return {"order_id": "", "is_algo": False}
                 except Exception as e2:
-                    logger.error(f"Disaster SL create retry failed {symbol}: {e2}")
+                    logger.error(f"Position SL create retry failed {symbol}: {e2}")
                     return {"order_id": "", "is_algo": False}
 
-            logger.error(f"Disaster SL create failed {symbol}: {e}")
+            logger.error(f"Position SL create failed {symbol}: {e}")
             return {"order_id": "", "is_algo": False}
+
 
     def fetch_order_safe(self, order_id: str, symbol: str) -> dict:
         """
@@ -1336,11 +1345,10 @@ class BinanceExecutor:
     def close_position(self, symbol, price=None, reason="EXIT", poll_timeout_sec=5.0):
         """
         시장가 청산.
-        - reduceOnly best-effort
-        - 재난 SL 조건주문 선취소
+        - reduceOnly 강제
+        - 기존 거래소 SL 조건주문(best-effort) 선취소
         - 성공 여부(True/False) 반환
         - ⚠️ positions 수정 금지 (엔진이 상태 권위)
-        - ✅ -1021(서버시간 불일치) 발생 시: time sync -> 재시도
         """
         pos = (self.positions or {}).get(symbol)
         if not pos:
@@ -1362,23 +1370,23 @@ class BinanceExecutor:
             if amt <= 0:
                 return False
 
-            # ✅ 재난 SL 선취소
+            # ✅ 거래소 상주 Position SL 선취소
             try:
-                ds_id = str(pos.get("disaster_sl_order_id") or "")
-                ds_algo = bool(pos.get("disaster_sl_is_algo", False))
-                if ds_id:
-                    self._cancel_conditional_order_safe(symbol, ds_id, ds_algo)
+                ex_id = str(pos.get("exchange_sl_order_id") or "")
+                ex_algo = bool(pos.get("exchange_sl_is_algo", False))
+                if ex_id:
+                    self._cancel_conditional_order_safe(symbol, ex_id, ex_algo)
             except Exception:
                 pass
 
             params_ro = self._signed_params({"reduceOnly": True})
 
-            order = None
-            try:
-                order = self.exchange.create_market_order(symbol, side_ccxt, amt, params=params_ro)
-            except Exception as e:
-                logger.warning(f"close reduceOnly failed (fallback) {symbol}: {e}")
-                order = self.exchange.create_market_order(symbol, side_ccxt, amt, params=self._signed_params({}))
+            order = self.exchange.create_market_order(
+                symbol,
+                side_ccxt,
+                amt,
+                params=params_ro,
+            )
 
             oid = None
             if isinstance(order, dict):
@@ -1416,20 +1424,6 @@ class BinanceExecutor:
                     self._sync_balance()
                     return bool(ok)
                 except Exception as e2:
-                    if _is_ts_error(e2):
-                        logger.error(f"Close retry failed {symbol}: {e2} -> time sync & retry2")
-                        try:
-                            self._sync_time_best_effort(force=True)
-                        except Exception:
-                            pass
-                        try:
-                            ok = _try_close_once()
-                            self._sync_balance()
-                            return bool(ok)
-                        except Exception as e3:
-                            logger.error(f"Close final failed {symbol}: {e3}")
-                            return False
-
                     logger.error(f"Close retry failed {symbol}: {e2}")
                     return False
 

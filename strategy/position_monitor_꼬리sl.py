@@ -35,28 +35,6 @@ class PositionMonitor:
     def __init__(self):
         pass
 
-    def _is_sl_hit(self, side: str, slv: float, curr_price: float,
-                   high_price: float, low_price: float,
-                   basis: str = "wick") -> bool:
-        """
-        basis:
-          - wick  : 기존 방식 (LONG low / SHORT high)
-          - close : 종가 확정 기준
-        """
-        b = str(basis or "close").strip().lower()
-        if b not in ("wick", "close"):
-            b = "close"
-
-        if b == "wick":
-            if side == "LONG":
-                return low_price <= slv
-            return high_price >= slv
-
-        # close-confirm
-        if side == "LONG":
-            return curr_price <= slv
-        return curr_price >= slv
-        
 
     def _emit_em_debug(self, market_data: dict, stage: str, payload: dict):
         """
@@ -381,17 +359,21 @@ class PositionMonitor:
                 })
                 return None, None
 
-            em_mfe_min = _safe_float(params.get("emergency_mfe_min_atr", 1.25), default=1.25) or 1.5
-            em_giveback = _safe_float(params.get("emergency_giveback_atr", 0.7), default=0.7) or 0.7
-            em_giveback_hard = _safe_float(params.get("emergency_giveback_hard_atr", 1), default=1) or 1
+            em_mfe_min = _safe_float(params.get("emergency_mfe_min_atr", 1.5), default=1.5) or 1.5
+            em_giveback = _safe_float(params.get("emergency_giveback_atr", 1.0), default=1.0) or 1.0
+            em_giveback_hard = _safe_float(params.get("emergency_giveback_hard_atr", 1.7), default=1.7) or 1.7
 
-            em_swing_len = int(params.get("emergency_swing_len", params.get("swing_len", 8)))
+            em_swing_len = int(params.get("emergency_swing_len", params.get("swing_len", 5)))
             em_struct_buf = _safe_float(
-                params.get("emergency_structure_buffer_atr", params.get("structure_buffer_atr", 0.55)), default=0.55) or 0.55
-            em_struct_confirm_atr = _safe_float(params.get("emergency_structure_confirm_atr", 0.5), default=0.5) or 0.5
+                params.get("emergency_structure_buffer_atr", params.get("structure_buffer_atr", 0.3)),
+                default=0.3
+            ) or 0.3
+            em_struct_confirm_atr = _safe_float(params.get("emergency_structure_confirm_atr", 0.0), default=0.0) or 0.0
 
             em_profit_lock = _safe_float(
-                params.get("emergency_profit_lock_atr", params.get("profit_lock_atr", 0.4)), default=0.2) or 0.2
+                params.get("emergency_profit_lock_atr", params.get("profit_lock_atr", 0.2)),
+                default=0.2
+            ) or 0.2
             fee_buffer_bps = _safe_float(params.get("fee_buffer_bps", 0.0), default=0.0) or 0.0
 
             gate_pass = bool(mfe_atr >= em_mfe_min)
@@ -769,32 +751,13 @@ class PositionMonitor:
             and (entry_time_s == candle_time_s)
         )
 
-        hit_basis = str(params.get("sl_hit_basis", "close") or "close").strip().lower()
-        if hit_basis not in ("wick", "close"):
-            hit_basis = "close"
-
-        self._emit_em_debug(market_data, "SL_HIT_BASIS", {
-            "symbol": symbol,
-            "side": side,
-            "mode": mode,
-            "hit_basis": hit_basis,
-            "effective_sl_for_hit": effective_sl_for_hit,
-            "curr_price": curr_price,
-            "high_price": high_price,
-            "low_price": low_price,
-        })
-
         sl_hit = False
         if (not is_entry_candle) and (effective_sl_for_hit is not None):
             slv = float(effective_sl_for_hit)
-            sl_hit = self._is_sl_hit(
-                side=side,
-                slv=slv,
-                curr_price=float(curr_price),
-                high_price=float(high_price),
-                low_price=float(low_price),
-                basis=hit_basis,
-            )
+            if side == "LONG" and low_price <= slv:
+                sl_hit = True
+            elif side == "SHORT" and high_price >= slv:
+                sl_hit = True
 
         if sl_hit:
             if mode == "next":

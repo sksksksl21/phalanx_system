@@ -9,9 +9,9 @@ from datetime import datetime
 from core.backtest_engine import BacktestEngine
 
 # ============================================================
-# [Optuna Optimization] TitanStrategy 20260307 aligned
-# - optimize_20260307의 frozen snapshot 구조 유지
-# - titan_strategy_20260307.py의 실제 params 키만 최적화
+# [Optuna Optimization] TitanStrategy (titan_strategy.py v8.3.0 기준)
+# - 전략(titan_strategy.py) 수정 없이 titan.set_params()만 사용
+# - 고정 유니버스 + 고정 RAW 캐시로 trial 간 비교 공정성 확보
 # - 산출물은 optuna_runs/<run_id>/ 아래로 전부 격리
 #
 # 실행 전 필요 파일:
@@ -41,7 +41,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_CACHE_FILE = os.path.join(CURRENT_DIR, "market_data_cache_7d.pkl")
 
-INITIAL_BALANCE = 2500.0
+INITIAL_BALANCE = 10000.0
 MIN_15M_ROWS = 600
 MIN_DAILY_ROWS = 40
 FIXED_UNIVERSE_SIZE = 29
@@ -62,7 +62,8 @@ def ensure_dir(path: str) -> str:
 
 def snapshot_universe(path: str, universe: list[str]):
     """
-    backtest_engine이 바로 읽을 수 있는 포맷으로 저장
+    백테 엔진이 바로 읽을 수 있는 포맷으로 저장한다.
+    기존 list-of-dicts 포맷은 backtest_engine.prepare_data()와 불일치했다.
     """
     ensure_dir(os.path.dirname(path))
     payload = {
@@ -71,7 +72,6 @@ def snapshot_universe(path: str, universe: list[str]):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-
 def write_metrics_row(csv_path: str, row: dict):
     df = pd.DataFrame([row])
     ensure_dir(os.path.dirname(csv_path))
@@ -79,7 +79,6 @@ def write_metrics_row(csv_path: str, row: dict):
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     else:
         df.to_csv(csv_path, index=False, mode="a", header=False, encoding="utf-8-sig")
-
 
 def load_cache_payload(cache_file: str):
     """
@@ -111,15 +110,15 @@ def load_cache_payload(cache_file: str):
 
     raise RuntimeError("❌ Invalid cache payload format")
 
-
 # ------------------------------------------------------------
-# Metrics
+# Metrics (from executor.history)
+# Expected: list[dict] with at least 'pnl' field per trade.
 # ------------------------------------------------------------
 def calculate_metrics(initial_balance: float, engine) -> dict | None:
     """
-    BacktestEngine의 MTM equity 기준 성과 계산
+    ✅ BacktestEngine이 실제로 유지하는 MTM equity 기준으로 성과를 계산한다.
     - Final Equity: engine.executor.equity
-    - MDD: engine.executor.equity_curve
+    - MDD: engine.executor.equity_curve (캔들 단위)
     - PF/WinRate 등은 executor.history(Exit net_pnl) 기반
     """
     if engine is None or not hasattr(engine, "executor") or engine.executor is None:
@@ -127,11 +126,11 @@ def calculate_metrics(initial_balance: float, engine) -> dict | None:
 
     ex = engine.executor
 
-    # --- Final Equity / Total Return ---
+    # --- Final Equity / Total Return (MTM) ---
     final_equity = float(getattr(ex, "equity", initial_balance))
     total_return = float((final_equity - initial_balance) / initial_balance * 100.0)
 
-    # --- MDD from equity_curve ---
+    # --- MDD from equity_curve (캔들 단위) ---
     curve = getattr(ex, "equity_curve", None) or []
     mdd = 0.0
     try:
@@ -141,11 +140,11 @@ def calculate_metrics(initial_balance: float, engine) -> dict | None:
             if len(eq):
                 peak = eq.cummax()
                 dd = (eq / peak.replace(0, np.nan)) - 1.0
-                mdd = float(dd.min() * 100.0)
+                mdd = float(dd.min() * 100.0)  # negative
     except Exception:
         mdd = 0.0
 
-    # --- Trade stats from history ---
+    # --- Trade stats from history (EXIT net_pnl) ---
     hist = getattr(ex, "history", None) or []
     df = pd.DataFrame(hist)
     if df.empty or "pnl" not in df.columns:
@@ -189,11 +188,12 @@ def calculate_metrics(initial_balance: float, engine) -> dict | None:
         "Total Trades": total_trades,
     }
 
-
 def _objective_score_from_metrics(metrics: dict) -> float:
     """
-    Best 값은 Final Equity로 두되,
-    참고용 Objective Score도 같이 저장
+    돈을 가장 우선하되, 지나치게 깨지는 조합은 약하게 페널티.
+    - Final Equity 중심
+    - PF / RR / WinRate 가산
+    - MDD 감점
     """
     final_equity = float(metrics.get("Final Equity", 0.0) or 0.0)
     profit_factor = float(metrics.get("Profit Factor", 0.0) or 0.0)
@@ -208,6 +208,7 @@ def _objective_score_from_metrics(metrics: dict) -> float:
     score -= mdd_abs * 45.0
 
     return float(score)
+
 
 
 def pick_top5_by_views(results_csv: str, min_trades: int = 30, topk: int = 5):
@@ -245,7 +246,7 @@ def pick_top5_by_views(results_csv: str, min_trades: int = 30, topk: int = 5):
 
 def redirect_trial_outputs(engine, result_csv_path: str):
     """
-    trial 중간 산출물을 run_dir 하위 trash로 몰아 루트 오염 방지
+    Trials overwrite the same two files under _trash_trial_outputs to avoid root pollution.
     """
     null_dir = ensure_dir(os.path.join(os.path.dirname(result_csv_path), "_trash_trial_outputs"))
     hist_path = os.path.join(null_dir, "backtest_history.csv")
@@ -263,19 +264,11 @@ def redirect_trial_outputs(engine, result_csv_path: str):
         if hasattr(ex, "equity_curve_file"):
             ex.equity_curve_file = curve_path
 
-
-# ------------------------------------------------------------
-# Strategy params: 20260307 aligned
-# ------------------------------------------------------------
 def _fixed_strategy_params() -> dict:
     """
-    titan_strategy_20260307.py 기준 고정 파라미터
-
-    고정 이유:
-    - bool toggle은 전략 의도 유지
-    - rsi_upper/rsi_lower/vol_factor/atr_regime_len/atr_regime_factor는
-      현재 20260307 analyze()에서 실질 신호차단 축으로 쓰이지 않거나
-      score/reference 성격이라 탐색 효율만 떨어뜨림
+    titan_strategy.py(v8.4.0) 기준 고정 파라미터.
+    - 토글은 현재 전략 의도대로 고정
+    - 탐색 효율을 위해 score-only/기반 세팅은 고정
     """
     return {
         # --- fixed bool toggles ---
@@ -285,21 +278,26 @@ def _fixed_strategy_params() -> dict:
         "use_structure_confirm": True,
         "use_vol_regime_gate": True,
         "atr_slope_gate": True,
+        "use_entry_scoring": True,
 
         # --- fixed non-search params ---
         "rsi_upper": 67,
         "rsi_lower": 30,
         "vol_factor": 0.8,
-        "ema_intraday": 200,
         "atr_regime_len": 50,
-        "atr_regime_factor": 1.05,
+        "ema_intraday": 200,
     }
 
 
 def _build_params_for_trial(trial) -> dict:
     """
-    titan_strategy_20260307.py의 실제 유효 파라미터만 탐색
+    titan_strategy.py(v8.4.0) 기준
+    - 기존 축 + Entry Quality 축까지 포함
+    - 너무 차원이 폭발하지 않도록 핵심 숫자축만 탐색
     """
+    fresh_long = trial.suggest_int("fresh_retest_bars_long", 2, 6)
+    fresh_short = trial.suggest_int("fresh_retest_bars_short", 2, 5)
+
     params = {
         # --------------------------------------------------
         # Core
@@ -308,10 +306,11 @@ def _build_params_for_trial(trial) -> dict:
         "atr_multiplier": trial.suggest_float("atr_multiplier", 1.75, 3.50, step=0.25),
 
         # --------------------------------------------------
-        # Filters
+        # Filters / Regime
         # --------------------------------------------------
         "adx_threshold": trial.suggest_int("adx_threshold", 4, 24, step=2),
         "daily_ema": trial.suggest_int("daily_ema", 10, 30, step=5),
+        "atr_regime_factor": trial.suggest_float("atr_regime_factor", 0.95, 1.20, step=0.05),
 
         # --------------------------------------------------
         # Structure / Retest geometry
@@ -320,10 +319,43 @@ def _build_params_for_trial(trial) -> dict:
         "context_lookback": trial.suggest_int("context_lookback", 45, 150, step=15),
         "retest_tolerance_atr": trial.suggest_float("retest_tolerance_atr", 0.20, 0.60, step=0.05),
         "structure_min_pivots": trial.suggest_int("structure_min_pivots", 2, 3, step=1),
+
+        # --------------------------------------------------
+        # Entry freshness
+        # --------------------------------------------------
+        "fresh_retest_bars_long": fresh_long,
+        "fresh_retest_bars_short": fresh_short,
+        "retest_max_bars_long": trial.suggest_int(
+            "retest_max_bars_long",
+            max(fresh_long + 1, 4),
+            12,
+            step=1,
+        ),
+        "retest_max_bars_short": trial.suggest_int(
+            "retest_max_bars_short",
+            max(fresh_short + 1, 4),
+            10,
+            step=1,
+        ),
+
+        # --------------------------------------------------
+        # Entry score thresholds
+        # --------------------------------------------------
+        "entry_score_long_min": trial.suggest_float("entry_score_long_min", 1.60, 2.60, step=0.05),
+        "entry_score_short_min": trial.suggest_float("entry_score_short_min", 1.80, 2.80, step=0.05),
+
+        # --------------------------------------------------
+        # Quality filters
+        # --------------------------------------------------
+        "sweep_max_body_ratio": trial.suggest_float("sweep_max_body_ratio", 0.30, 0.65, step=0.05),
+        "sweep_reclaim_min": trial.suggest_float("sweep_reclaim_min", 0.45, 0.75, step=0.05),
+        "retest_body_min": trial.suggest_float("retest_body_min", 0.10, 0.40, step=0.05),
+        "retest_reclaim_min": trial.suggest_float("retest_reclaim_min", 0.45, 0.75, step=0.05),
     }
 
     params.update(_fixed_strategy_params())
     return params
+
 
 
 def _validate_param_keys(engine, params: dict):
@@ -335,14 +367,14 @@ def _validate_param_keys(engine, params: dict):
     if unknown:
         raise KeyError(f"Unknown params for TitanStrategy: {unknown}")
 
-
-# ------------------------------------------------------------
-# Frozen snapshot build / clone
-# ------------------------------------------------------------
 def build_frozen_backtest_snapshot(universe: list[str], days: int) -> dict:
     """
     백테와 동일한 prepare_data 경로를 1회만 실행해서
-    15m / daily / 1m 데이터를 모두 freeze 한다.
+    15m / daily / 1m 데이터를 모두 동결(freeze)한다.
+
+    이후 각 trial은 이 frozen snapshot만 깊은 복사해서 사용하므로:
+    - trial 간 데이터 공정성 유지
+    - 일반 백테와 동일한 데이터 준비 경로 사용
     """
     seed_engine = BacktestEngine(days=days)
     seed_engine.prepare_data(symbols=list(universe))
@@ -382,7 +414,10 @@ def build_frozen_backtest_snapshot(universe: list[str], days: int) -> dict:
 
 def _clone_cache_into_engine(engine, frozen_snapshot: dict):
     """
-    frozen snapshot을 trial/export용 엔진에 깊은 복사로 주입
+    frozen backtest snapshot을 trial/export용 엔진에 깊은 복사로 주입한다.
+    - 15m raw
+    - daily context raw
+    - 1m intrabar raw/data
     """
     universe = list(frozen_snapshot.get("universe", []) or [])
     raw_15m_map = frozen_snapshot.get("raw_15m_map", {}) or {}
@@ -418,13 +453,14 @@ def _clone_cache_into_engine(engine, frozen_snapshot: dict):
             df1_data = data_1m_map[sym]
             engine.data_1m_map[sym] = df1_data.copy(deep=True) if hasattr(df1_data, "copy") else df1_data
 
-
 # ------------------------------------------------------------
-# Objective
+# Objective (new engine per trial)
 # ------------------------------------------------------------
 def objective(trial, frozen_snapshot, result_csv_path: str):
     """
-    최적화 타깃은 Final Equity 고정
+    최적화 타깃을 Final Equity로 고정한다.
+    - study.best_value == 백테 Final Equity
+    - Objective Score는 참고 컬럼으로만 기록
     """
     engine = BacktestEngine(days=OPT_DAYS)
     _clone_cache_into_engine(engine, frozen_snapshot)
@@ -468,7 +504,7 @@ def objective(trial, frozen_snapshot, result_csv_path: str):
 
 
 # ------------------------------------------------------------
-# Export helper
+# Export helper: rerun and save full logs
 # ------------------------------------------------------------
 def run_one_and_export(frozen_snapshot, params: dict, out_dir: str, tag: str, days: int = 30):
     ensure_dir(out_dir)
@@ -515,6 +551,7 @@ def run_one_and_export(frozen_snapshot, params: dict, out_dir: str, tag: str, da
     return metrics
 
 
+
 def _extract_params_from_row(row: pd.Series) -> dict:
     def _to_int(x, default=0):
         if pd.isna(x):
@@ -529,30 +566,49 @@ def _extract_params_from_row(row: pd.Series) -> dict:
     params = _fixed_strategy_params()
 
     params.update({
+        # Core
         "atr_period": _to_int(row.get("atr_period"), 16),
         "atr_multiplier": _to_float(row.get("atr_multiplier"), 2.25),
+
+        # Filters / Regime
         "adx_threshold": _to_int(row.get("adx_threshold"), 12),
         "daily_ema": _to_int(row.get("daily_ema"), 15),
+        "atr_regime_factor": _to_float(row.get("atr_regime_factor"), 1.05),
 
+        # Structure / Retest
         "swing_len": _to_int(row.get("swing_len"), 3),
         "context_lookback": _to_int(row.get("context_lookback"), 60),
         "retest_tolerance_atr": _to_float(row.get("retest_tolerance_atr"), 0.35),
         "structure_min_pivots": _to_int(row.get("structure_min_pivots"), 2),
+
+        # Freshness
+        "fresh_retest_bars_long": _to_int(row.get("fresh_retest_bars_long"), 4),
+        "fresh_retest_bars_short": _to_int(row.get("fresh_retest_bars_short"), 3),
+        "retest_max_bars_long": _to_int(row.get("retest_max_bars_long"), 8),
+        "retest_max_bars_short": _to_int(row.get("retest_max_bars_short"), 6),
+
+        # Entry score thresholds
+        "entry_score_long_min": _to_float(row.get("entry_score_long_min"), 2.15),
+        "entry_score_short_min": _to_float(row.get("entry_score_short_min"), 2.30),
+
+        # Quality filters
+        "sweep_max_body_ratio": _to_float(row.get("sweep_max_body_ratio"), 0.45),
+        "sweep_reclaim_min": _to_float(row.get("sweep_reclaim_min"), 0.55),
+        "retest_body_min": _to_float(row.get("retest_body_min"), 0.20),
+        "retest_reclaim_min": _to_float(row.get("retest_reclaim_min"), 0.55),
     })
 
     return params
-
-
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
 def main():
-    print("🚀 Optuna Optimization Start (Backtest-Aligned Frozen Snapshot / Strategy_20260307)")
+    print("🚀 Optuna Optimization Start (Backtest-Aligned Frozen Snapshot)")
 
     if not os.path.exists(DATA_CACHE_FILE):
         raise RuntimeError(f"❌ RAW DATA CACHE NOT FOUND: {DATA_CACHE_FILE}")
 
-    # cache는 universe 후보 선정용
+    # cache는 universe 후보 선정을 위한 용도로만 사용
     raw_15m_map, raw_daily_map, cache_meta = load_cache_payload(DATA_CACHE_FILE)
 
     if not raw_15m_map:
@@ -561,10 +617,10 @@ def main():
     if not raw_daily_map:
         raise RuntimeError("❌ Daily cache missing. Rebuild cache with down_pkl.py first.")
 
-    daily_need_days = int(cache_meta.get("daily_need_days", MIN_DAILY_ROWS) or MIN_DAILY_ROWS)
+    daily_need_days = int(cache_meta.get("daily_need_days", 40) or 40)
 
     # --------------------------------------------------------
-    # Run directory
+    # Run directory (isolation)
     # --------------------------------------------------------
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     run_dir = ensure_dir(os.path.join(CURRENT_DIR, "optuna_runs", run_id))
@@ -609,7 +665,7 @@ def main():
     print(f"🧭 Candidate Universe ({len(universe)}): {universe}")
 
     # --------------------------------------------------------
-    # Build backtest-aligned frozen snapshot
+    # Build backtest-aligned frozen snapshot (critical)
     # --------------------------------------------------------
     frozen_snapshot = build_frozen_backtest_snapshot(universe, days=OPT_DAYS)
     universe = list(frozen_snapshot.get("universe", []) or [])
@@ -671,20 +727,23 @@ def main():
     with open(os.path.join(reports_dir, "universe.json"), "w", encoding="utf-8") as f:
         json.dump({"universe": universe}, f, ensure_ascii=False, indent=2)
 
+    # 5 reruns (days=OPT_DAYS) to produce full logs
     for i, (view_name, trial_id, params) in enumerate(picked, start=1):
         view_dir = ensure_dir(os.path.join(reports_dir, view_name))
         tag = f"rank_{i:02d}_trial{trial_id}"
         print(f"📌 Exporting {view_name}/{tag}")
         run_one_and_export(frozen_snapshot, params, view_dir, tag=tag, days=OPT_DAYS)
 
+    # Save the top5 tables as CSV
     for v, dfv in views.items():
         dfv.to_csv(os.path.join(reports_dir, f"top5_{v}.csv"), index=False, encoding="utf-8-sig")
 
-    # Best / baseline
+    # Best & baseline exports
     best_params = _fixed_strategy_params()
     best_params.update(dict(study.best_trial.params))
     best_dir = ensure_dir(os.path.join(reports_dir, "best"))
 
+    # Baseline = strategy defaults pulled from a fresh engine
     base_engine = BacktestEngine(days=OPT_DAYS)
     baseline_params = dict(getattr(base_engine.titan, "params", {}))
     baseline_params.update(_fixed_strategy_params())
@@ -707,7 +766,6 @@ def main():
         json.dump(baseline_params, f, ensure_ascii=False, indent=2)
 
     print(f"✅ Reports saved under: {reports_dir}")
-
 
 if __name__ == "__main__":
     main()

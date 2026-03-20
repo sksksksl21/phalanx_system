@@ -21,6 +21,7 @@
 # - UPDATE_SL (옵션) / EXIT
 # =========================================================
 
+from operator import pos
 import sys
 import os
 import json
@@ -31,7 +32,6 @@ import pandas as pd
 import pandas_ta as ta
 import urllib.parse
 import urllib.request
-
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "phalanx_live.log")
 LOG_PATH = os.path.abspath(LOG_PATH)
@@ -67,7 +67,7 @@ class TelegramNotifier:
       - telegram_token / telegram_chat_id
       - system_settings:
           telegram_enabled (optional)
-          telegram_send_update_sl (default True)
+          telegram_send_update_sl (default False)
           telegram_send_heartbeat (default False)
           telegram_tag (default 'PHALANX')
           telegram_dedup_window_sec (default 15)
@@ -1597,10 +1597,9 @@ class LiveEngine:
         - 실패하면 기존 validated_map 유지
 
         정합 강화:
-        - 15m intraday 지표 웜업 목적의 최소 히스토리만 보장
-        - DAILY EMA는 1D 캐시(raw_daily_map)에서 별도 주입되므로
-        15m 기준 40일치(40*96봉) 강제는 제거
-        - 단일 fetch(limit=want)의 거래소 제한을 피하기 위해 pagination으로 누적 fetch
+        - EMA200/ATR(SuperTrend) 웜업을 위해 최소 600봉 강제
+        - DAILY EMA용 최소 40일봉 보장을 위해 15m 기준 최소 40*96봉 강제
+        - 단일 fetch(limit=want) 의 거래소 제한을 피하기 위해 pagination으로 누적 fetch
         """
         out = dict(validated_map or {})
 
@@ -1618,12 +1617,21 @@ class LiveEngine:
             except Exception:
                 p = {}
 
-            # ✅ intraday warmup만 보장
-            # - min_bars: 엔진 호출부 요구치
-            # - 600봉: EMA/ATR/ST/ADX 등 15m 지표 안정화용 하한
+            # DAILY EMA는 전략에서 15m -> D resample로 계산하므로
+            # 최소 40일봉 보장을 위해 15m 기준 40*96 봉을 강제
+            try:
+                daily_ema_len = int(p.get("daily_ema", 25) or 25)
+            except Exception:
+                daily_ema_len = 25
+
+            daily_need_days = max(40, daily_ema_len + 5)   # 최소 40일, 전략 최소요구(daily_ema+5)도 반영
+            bars_per_day_15m = int((24 * 60) // 15)        # 96
+            daily_need_15m = int(daily_need_days * bars_per_day_15m)
+
             want = int(min_bars or 0)
-            want = max(want, 600)
-            want = want + 50  # 여유분(누락/정렬/지표계산)
+            want = max(want, 600)           # intraday warmup
+            want = max(want, daily_need_15m)
+            want = want + 50                # 여유분(누락/정렬/지표계산)
 
             tf_ms = int(self.tf15_sec * 1000)
             batch_limit = 1500  # Binance/CCXT 일반 제한 대응
@@ -1713,6 +1721,7 @@ class LiveEngine:
             return out
 
         return out
+
 
     # -----------------------------------------------------
     # Time / Loop Authority
@@ -2037,7 +2046,7 @@ class LiveEngine:
         except Exception:
             daily_len = 25
 
-        need_days = int(max(100, daily_len * 4))
+        need_days = int(max(40, daily_len + 5))
         loaded = 0
 
         stats = {
@@ -2063,7 +2072,7 @@ class LiveEngine:
                     continue
 
                 end_dt = pd.Timestamp(df15.index.max()).normalize() + pd.Timedelta(days=1)
-                since_dt = end_dt - pd.Timedelta(days=int(need_days + 30))
+                since_dt = end_dt - pd.Timedelta(days=int(need_days + 5))
 
                 since_ms = int(pd.Timestamp(since_dt).timestamp() * 1000)
                 until_ms = int(pd.Timestamp(end_dt).timestamp() * 1000)
@@ -2150,7 +2159,7 @@ class LiveEngine:
         except Exception:
             daily_len = 25
 
-        need_days = int(max(100, daily_len * 4))
+        need_days = int(max(40, daily_len + 5))
 
         dfd = getattr(self, "raw_daily_map", {}).get(sym)
         if dfd is None or dfd.empty:
@@ -2940,46 +2949,6 @@ class LiveEngine:
             pass
 
         return float(px)
-
-    def _resolve_update_sl_display(self, pos: dict, apply_mode: str, fallback_new_sl=None) -> dict:
-        """
-        UPDATE_SL 표시/기록용 SL 선택
-        - same 모드: active SL(pos['sl'])
-        - next 모드: 예약된 next_sl(pos['next_sl'])
-        """
-        def _sf(x):
-            try:
-                v = float(x)
-                if not math.isfinite(v) or v <= 0:
-                    return None
-                return float(v)
-            except Exception:
-                return None
-
-        mode = str(apply_mode or "same").strip().lower()
-        if mode not in ("same", "next"):
-            mode = "same"
-
-        current_sl = _sf((pos or {}).get("sl"))
-        next_sl = _sf((pos or {}).get("next_sl"))
-        fb_sl = _sf(fallback_new_sl)
-
-        if mode == "next":
-            display_sl = next_sl if next_sl is not None else (fb_sl if fb_sl is not None else current_sl)
-            target = "NEXT_SL"
-        else:
-            display_sl = current_sl if current_sl is not None else fb_sl
-            target = "ACTIVE_SL"
-
-        return {
-            "mode": mode,
-            "target": target,
-            "display_sl": display_sl,
-            "current_sl": current_sl,
-            "next_sl": next_sl,
-        }
-
-
     # -----------------------------------------------------
     # Candle Picking (15m stale blocking fix)
     # -----------------------------------------------------
@@ -3263,12 +3232,10 @@ class LiveEngine:
     # - placement: right after def _diagnose_retest(...)
     # -----------------------------------------------------
     def _debug_analyze_result(self, sym: str, past_data: pd.DataFrame,
-                            signal, sl, tp,
-                            max_samples: int = 2):
+                              signal, sl, tp,
+                              max_samples: int = 2):
         """
-        ✅ Titan 8.2.1-LiquidityMSSPullback-VolScoreOnly 기준 최종 반환값 디버그
-        - continuation/pullback 잔재 제거
-        - MSS / retest / volume-score / daily / ST 기준으로 스냅샷 출력
+        ✅ continuation pullback 전략 기준 최종 반환값 디버그
         """
         try:
             dbg_cnt = getattr(self, "_analyze_dbg_count", 0)
@@ -3297,7 +3264,6 @@ class LiveEngine:
                 return None
 
         snapshot = {
-            # price / base indicators
             "close": _f(curr.get("close")),
             "high": _f(curr.get("high")),
             "low": _f(curr.get("low")),
@@ -3305,30 +3271,14 @@ class LiveEngine:
             "adx": _f(curr.get("adx")),
             "ema_intra": _f(curr.get("ema_intra")),
             "ema_daily": _f(curr.get("ema_daily")),
-            "ema_daily_ok": _i(curr.get("ema_daily_ok")),
             "st_dir": _i(curr.get("st_dir")),
             "st_val": _f(curr.get("st_val")),
-
-            # volume score only
-            "vol_ratio_prev": _f(curr.get("vol_ratio_prev")),
-            "vol_score_prev": _f(curr.get("vol_score_prev")),
-            "vol_ok_like_prev": _i(curr.get("vol_ok_like_prev")),
-
-            # liquidity / MSS / retest
-            "sweep_high": _i(curr.get("sweep_high")),
-            "sweep_low": _i(curr.get("sweep_low")),
-            "recent_sweep_high": _i(curr.get("recent_sweep_high")),
-            "recent_sweep_low": _i(curr.get("recent_sweep_low")),
-            "mss_up_trigger": _i(curr.get("mss_up_trigger")),
-            "mss_down_trigger": _i(curr.get("mss_down_trigger")),
-            "mss_age_up": _f(curr.get("mss_age_up")),
-            "mss_age_down": _f(curr.get("mss_age_down")),
-            "mss_active_up": _i(curr.get("mss_active_up")),
-            "mss_active_down": _i(curr.get("mss_active_down")),
-            "mss_level_up": _f(curr.get("mss_level_up")),
-            "mss_level_down": _f(curr.get("mss_level_down")),
-            "retest_long": _i(curr.get("retest_long")),
-            "retest_short": _i(curr.get("retest_short")),
+            "trend_up": _i(curr.get("trend_up")),
+            "trend_down": _i(curr.get("trend_down")),
+            "pullback_long_recent": _i(curr.get("pullback_long_recent")),
+            "pullback_short_recent": _i(curr.get("pullback_short_recent")),
+            "continuation_long": _i(curr.get("continuation_long")),
+            "continuation_short": _i(curr.get("continuation_short")),
         }
 
         logger.info(
@@ -3346,6 +3296,7 @@ class LiveEngine:
 
 
 
+
     # =========================================================
     # [MOD] _compute_candidates_15m() 내부 교체 패치
     # - "idx/get_loc + iloc[:idx+1] + _slice_for_strategy" 제거
@@ -3353,9 +3304,9 @@ class LiveEngine:
     # =========================================================
     def _compute_candidates_15m(self, current_time_15m, symbols=None):
         """
-        ✅ Titan 8.2.1-LiquidityMSSPullback-VolScoreOnly 기준 후보 계산
-        - analyze()는 MSS + retest + daily/ADX/ST 를 그대로 사용
-        - 후보 우선순위(score)는 adx가 아니라 vol_score_prev 사용
+        ✅ continuation pullback 전략 기준 후보 계산
+        - 추가 데이터 fetch 없음
+        - TitanStrategy.analyze() 반환값을 그대로 사용
         - debug_entry_trace 시 strategy-aligned gate trace 출력
         """
 
@@ -3437,21 +3388,12 @@ class LiveEngine:
                     "ema_daily_ok": _i(curr.get("ema_daily_ok"), None),
                     "st_dir": _i(curr.get("st_dir"), None),
                     "st_val": _f(curr.get("st_val"), None),
-
-                    "vol_ratio_prev": _f(curr.get("vol_ratio_prev"), None),
-                    "vol_score_prev": _f(curr.get("vol_score_prev"), None),
-                    "vol_ok_like_prev": _i(curr.get("vol_ok_like_prev"), None),
-
-                    "recent_sweep_high": _i(curr.get("recent_sweep_high"), None),
-                    "recent_sweep_low": _i(curr.get("recent_sweep_low"), None),
-                    "mss_up_trigger": _i(curr.get("mss_up_trigger"), None),
-                    "mss_down_trigger": _i(curr.get("mss_down_trigger"), None),
-                    "mss_active_up": _i(curr.get("mss_active_up"), None),
-                    "mss_active_down": _i(curr.get("mss_active_down"), None),
-                    "mss_level_up": _f(curr.get("mss_level_up"), None),
-                    "mss_level_down": _f(curr.get("mss_level_down"), None),
-                    "retest_long": _i(curr.get("retest_long"), None),
-                    "retest_short": _i(curr.get("retest_short"), None),
+                    "trend_up": _i(curr.get("trend_up"), None),
+                    "trend_down": _i(curr.get("trend_down"), None),
+                    "pullback_long_recent": _i(curr.get("pullback_long_recent"), None),
+                    "pullback_short_recent": _i(curr.get("pullback_short_recent"), None),
+                    "continuation_long": _i(curr.get("continuation_long"), None),
+                    "continuation_short": _i(curr.get("continuation_short"), None),
                 }
             except Exception:
                 return {}
@@ -3460,56 +3402,50 @@ class LiveEngine:
             try:
                 p = getattr(self.titan, "params", {}) or {}
 
-                close = _f(curr.get("close"), 0.0)
-                adx = _f(curr.get("adx"), 0.0)
+                close = float(curr.get("close", 0.0) or 0.0)
+                ema_daily_ok = int(curr.get("ema_daily_ok", 0) or 0) == 1
                 ema_daily = _f(curr.get("ema_daily"), None)
-                ema_daily_ok = (_i(curr.get("ema_daily_ok"), 0) == 1)
+                adx = float(curr.get("adx", 0.0) or 0.0)
 
-                use_daily = bool(p.get("use_daily_filter", True))
-                adx_threshold = float(p.get("adx_threshold", 0) or 0)
-                adx_filter_on = adx_threshold > 0
+                daily_up = bool(ema_daily_ok and (ema_daily is not None) and (close > ema_daily))
+                daily_dn = bool(ema_daily_ok and (ema_daily is not None) and (close < ema_daily))
+                adx_ok = bool(adx > float(p.get("adx_threshold", 0) or 0))
 
-                daily_up = (close > ema_daily) if (use_daily and ema_daily_ok and ema_daily is not None) else True
-                daily_dn = (close < ema_daily) if (use_daily and ema_daily_ok and ema_daily is not None) else True
-                adx_ok = (adx > adx_threshold) if adx_filter_on else True
-
-                retest_long = (_i(curr.get("retest_long"), 0) == 1)
-                retest_short = (_i(curr.get("retest_short"), 0) == 1)
-
-                lvl_up = _f(curr.get("mss_level_up"), None)
-                lvl_dn = _f(curr.get("mss_level_down"), None)
-                level_ok = ((lvl_up is not None and lvl_up > 0) or (lvl_dn is not None and lvl_dn > 0))
+                trend_up = int(curr.get("trend_up", 0) or 0) == 1
+                trend_down = int(curr.get("trend_down", 0) or 0) == 1
+                pb_long = int(curr.get("pullback_long_recent", 0) or 0) == 1
+                pb_short = int(curr.get("pullback_short_recent", 0) or 0) == 1
+                cont_long = int(curr.get("continuation_long", 0) or 0) == 1
+                cont_short = int(curr.get("continuation_short", 0) or 0) == 1
 
                 pre_sig = None
-                if level_ok:
-                    if retest_long and daily_up and adx_ok:
-                        pre_sig = "LONG"
-                    elif retest_short and daily_dn and adx_ok:
-                        pre_sig = "SHORT"
+                if trend_up and pb_long and cont_long and daily_up and adx_ok:
+                    pre_sig = "LONG"
+                elif trend_down and pb_short and cont_short and daily_dn and adx_ok:
+                    pre_sig = "SHORT"
 
                 post_sig = pre_sig
-                if pre_sig is not None and bool(p.get("use_st_dir_filter", True)):
-                    st_dir = _i(curr.get("st_dir"), 0)
+                if pre_sig is not None:
+                    st_dir = int(curr.get("st_dir", 0) or 0)
                     st_val = _f(curr.get("st_val"), None)
 
                     if pre_sig == "LONG":
-                        if (st_dir is None or st_dir <= 0) or (st_val is not None and st_val >= close):
+                        if (st_dir <= 0) or (st_val is not None and st_val >= close):
                             post_sig = None
                     else:
-                        if (st_dir is None or st_dir >= 0) or (st_val is not None and st_val <= close):
+                        if (st_dir >= 0) or (st_val is not None and st_val <= close):
                             post_sig = None
 
                 return {
-                    "daily_up": int(bool(daily_up)),
-                    "daily_dn": int(bool(daily_dn)),
-                    "adx_ok": int(bool(adx_ok)),
-                    "level_ok": int(bool(level_ok)),
-                    "retest_long": int(bool(retest_long)),
-                    "retest_short": int(bool(retest_short)),
-                    "mss_up": int(_i(curr.get("mss_up_trigger"), 0) == 1),
-                    "mss_dn": int(_i(curr.get("mss_down_trigger"), 0) == 1),
-                    "vol_ok_like": int(_i(curr.get("vol_ok_like_prev"), 0) == 1),
-                    "vol_score": _f(curr.get("vol_score_prev"), 0.0),
+                    "daily_up": int(daily_up),
+                    "daily_dn": int(daily_dn),
+                    "adx_ok": int(adx_ok),
+                    "trend_up": int(trend_up),
+                    "trend_down": int(trend_down),
+                    "pbL": int(pb_long),
+                    "pbS": int(pb_short),
+                    "contL": int(cont_long),
+                    "contS": int(cont_short),
                     "pre_sig": pre_sig,
                     "post_sig": post_sig,
                 }
@@ -3581,8 +3517,8 @@ class LiveEngine:
                 continue
 
             try:
-                score = curr_row.get("vol_score_prev", 0.0)
-                score = float(score) if score is not None and math.isfinite(float(score)) else 0.0
+                score = curr_row.get("adx", 0)
+                score = float(score) if score is not None else 0.0
             except Exception:
                 score = 0.0
 
@@ -3596,19 +3532,7 @@ class LiveEngine:
             })
 
             try:
-                vol_ratio = curr_row.get("vol_ratio_prev", None)
-                vol_ratio = float(vol_ratio) if vol_ratio is not None and math.isfinite(float(vol_ratio)) else None
-
-                if vol_ratio is None:
-                    logger.info(
-                        f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} "
-                        f"vol_score={score:.4f} sl={sl} tp={tp}"
-                    )
-                else:
-                    logger.info(
-                        f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} "
-                        f"vol_score={score:.4f} vol_ratio={vol_ratio:.4f} sl={sl} tp={tp}"
-                    )
+                logger.info(f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} adx={score:.2f} sl={sl} tp={tp}")
             except Exception:
                 logger.info(f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} sl={sl} tp={tp}")
 
@@ -3622,6 +3546,7 @@ class LiveEngine:
             )
 
         return candidates
+
 
 
 
@@ -4287,9 +4212,6 @@ class LiveEngine:
 
         ✅ entry_price 복구:
         - 기존 포지션에 entry_price가 비어 있으면 주문조회/실포지션조회로 보강 시도
-
-        ✅ UPDATE_SL 표시/기록 수정:
-        - next 모드에서는 active sl이 아니라 예약된 next_sl을 기록/알림
         """
         pos = self.executor.positions.get(sym)
         if not pos:
@@ -4522,14 +4444,6 @@ class LiveEngine:
                 pass
 
         if action == "UPDATE_SL":
-            display = {
-                "mode": apply_mode,
-                "target": "ACTIVE_SL",
-                "display_sl": None,
-                "current_sl": None,
-                "next_sl": None,
-            }
-
             try:
                 if new_sl is not None:
                     new_sl_f = float(new_sl)
@@ -4555,29 +4469,10 @@ class LiveEngine:
                             pos["next_sl"] = None
                             pos["next_sl_bucket"] = None
                             self._save_state()
-
-                display = self._resolve_update_sl_display(
-                    pos=pos,
-                    apply_mode=apply_mode,
-                    fallback_new_sl=new_sl,
-                )
             except Exception:
                 pass
 
             try:
-                reason_txt = str(reason or "TRAILING")
-                if display["mode"] == "next":
-                    reason_txt = (
-                        f"{reason_txt} | target=NEXT_SL "
-                        f"| current_sl={display['current_sl']} "
-                        f"| next_sl={display['next_sl']}"
-                    )
-                else:
-                    reason_txt = (
-                        f"{reason_txt} | target=ACTIVE_SL "
-                        f"| current_sl={display['current_sl']}"
-                    )
-
                 self._append_history({
                     "dt": market_data.get("candle_time"),
                     "event": "UPDATE_SL",
@@ -4586,8 +4481,8 @@ class LiveEngine:
                     "side": pos.get("side"),
                     "price": float(market_data.get("close") or 0),
                     "amount": float(pos.get("amount") or 0),
-                    "sl": float(display["display_sl"]) if display["display_sl"] is not None else None,
-                    "reason": reason_txt[:800],
+                    "sl": float(pos.get("sl")) if pos.get("sl") is not None else None,
+                    "reason": (reason or "TRAILING")[:800],
                     "pos_count": int(len(self.executor.positions or {})),
                     "cash": float(self._last_cash or 0),
                     "equity": float(self._last_equity or 0),
@@ -4597,19 +4492,15 @@ class LiveEngine:
 
             try:
                 if getattr(self, "notifier", None):
-                    lines = [
-                        f"t={market_data.get('candle_time')}",
-                        f"symbol={sym}",
-                        f"side={pos.get('side')}",
-                        f"new_sl={display['display_sl']}",
-                        f"apply_mode={apply_mode}",
-                    ]
-                    if display["mode"] == "next":
-                        lines.append(f"current_sl={display['current_sl']}")
-                        lines.append(f"next_sl={display['next_sl']}")
                     self.notifier.send(
                         title="UPDATE_SL",
-                        lines=lines,
+                        lines=[
+                            f"t={market_data.get('candle_time')}",
+                            f"symbol={sym}",
+                            f"side={pos.get('side')}",
+                            f"new_sl={pos.get('sl')}",
+                            f"apply_mode={apply_mode}",
+                        ],
                     )
             except Exception as e:
                 logger.error(f"UPDATE_SL telegram failed | {sym} | {e}")
@@ -4710,15 +4601,12 @@ class LiveEngine:
                 return default
 
         # ✅ 핵심: manage 직전 1m intrabar 준비
-        # 보유 포지션에 대해서만 1m intrabar를 준비한다.
-        intrabar_prep_syms = sorted(set(pos_keys))
         try:
-            if intrabar_prep_syms:
-                self._prepare_intrabar_1m_live(
-                    symbols=intrabar_prep_syms,
-                    authority_time=authority_time,
-                    lookback_bars=4,
-                )
+            self._prepare_intrabar_1m_live(
+                symbols=list(manage_syms),
+                authority_time=authority_time,
+                lookback_bars=4,
+            )
         except Exception as e:
             logger.error(f"LIVE_INTRABAR_PREP_FAIL | {type(e).__name__}: {e}")
 
@@ -4771,7 +4659,6 @@ class LiveEngine:
                     pass
 
         return current_prices, exit_ct, upd_ct, manage_cnt
-
 
     def _force_mark_to_market_equity_live(self, prices: dict) -> float:
         """

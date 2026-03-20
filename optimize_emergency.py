@@ -269,61 +269,243 @@ def redirect_trial_outputs(engine, result_csv_path: str):
 # ------------------------------------------------------------
 def _fixed_strategy_params() -> dict:
     """
-    titan_strategy_20260307.py 기준 고정 파라미터
+    Continuation Pullback 전략은 이미 파라미터가 최소화되어 있으므로
+    별도의 legacy fixed toggle을 주입하지 않는다.
+    """
+    return {}
 
-    고정 이유:
-    - bool toggle은 전략 의도 유지
-    - rsi_upper/rsi_lower/vol_factor/atr_regime_len/atr_regime_factor는
-      현재 20260307 analyze()에서 실질 신호차단 축으로 쓰이지 않거나
-      score/reference 성격이라 탐색 효율만 떨어뜨림
+def _fixed_monitor_params() -> dict:
+    """
+    PositionMonitor emergency 기본값
+    position_monitor.py fallback과 맞춤
     """
     return {
-        # --- fixed bool toggles ---
-        "use_daily_filter": True,
-        "use_vol_filter": True,
-        "use_st_dir_filter": True,
-        "use_structure_confirm": True,
-        "use_vol_regime_gate": True,
-        "atr_slope_gate": True,
-
-        # --- fixed non-search params ---
-        "rsi_upper": 67,
-        "rsi_lower": 30,
-        "vol_factor": 0.8,
-        "ema_intraday": 200,
-        "atr_regime_len": 50,
-        "atr_regime_factor": 1.05,
+        "emergency_mfe_min_atr": 1.5,
+        "emergency_giveback_atr": 1.0,
+        "emergency_giveback_hard_atr": 1.7,
+        "emergency_swing_len": 5,
+        "emergency_structure_buffer_atr": 0.3,
+        "emergency_structure_confirm_atr": 0.0,
+        "emergency_profit_lock_atr": 0.2,
+        "fee_buffer_bps": 0.0,
     }
 
+def _upsert_dict_attr(owner, attr_name: str, params: dict):
+    if owner is None:
+        return
+    cur = getattr(owner, attr_name, None)
+    if isinstance(cur, dict):
+        cur.update(params)
+    else:
+        setattr(owner, attr_name, dict(params))
+
+
+def _upsert_config_dicts(owner, params: dict):
+    if owner is None:
+        return
+    cfg = getattr(owner, "config", None)
+    if not isinstance(cfg, dict):
+        return
+
+    for key in ("sl_params", "position_monitor_params", "monitor_params", "exit_params"):
+        cur = cfg.get(key)
+        if isinstance(cur, dict):
+            cur.update(params)
+        else:
+            cfg[key] = dict(params)
+
+
+def _upsert_position_monitor_params(owner, params: dict):
+    if owner is None:
+        return
+    pm = getattr(owner, "position_monitor", None)
+    if pm is None:
+        return
+
+    cur = getattr(pm, "params", None)
+    if isinstance(cur, dict):
+        cur.update(params)
+    else:
+        setattr(pm, "params", dict(params))
+
+
+def _force_apply_monitor_params(engine, params: dict):
+    """
+    engine / executor / 하위 객체 전반에 emergency params를 강제 주입
+    + BacktestEngine의 실제 소비 경로인
+      cfg["system_settings"]["sl_params"] 까지 반드시 반영
+    """
+    if engine is None:
+        return
+
+    targets = [engine, getattr(engine, "executor", None)]
+
+    for child_name in ("backtester", "broker", "manager"):
+        child = getattr(engine, child_name, None)
+        if child is not None:
+            targets.append(child)
+
+    for obj in targets:
+        if obj is None:
+            continue
+
+        # 1) 일반 dict 속성들
+        for attr in ("sl_params", "position_monitor_params", "monitor_params", "exit_params"):
+            _upsert_dict_attr(obj, attr, params)
+
+        # 2) config 루트 dict들
+        _upsert_config_dicts(obj, params)
+
+        # 3) position_monitor.params
+        _upsert_position_monitor_params(obj, params)
+
+        # 4) titan.params에도 병합 (일부 경로 방어)
+        titan = getattr(obj, "titan", None)
+        if titan is not None and isinstance(getattr(titan, "params", None), dict):
+            titan.params.update(params)
+
+        # 5) 핵심: BacktestEngine 실제 소비 경로
+        #    self.cfg["system_settings"]["sl_params"]
+        cfg = getattr(obj, "cfg", None)
+        if isinstance(cfg, dict):
+            ss = cfg.get("system_settings", None)
+            if not isinstance(ss, dict):
+                ss = {}
+                cfg["system_settings"] = ss
+
+            cur = ss.get("sl_params", None)
+            if isinstance(cur, dict):
+                cur.update(params)
+            else:
+                ss["sl_params"] = dict(params)
+
+def _assert_monitor_params_applied(engine, params: dict):
+    """
+    silent fallback 방지:
+    1) engine.sl_params
+    2) engine.cfg["system_settings"]["sl_params"]
+    둘 다 실제로 반영됐는지 확인
+    """
+    sl = getattr(engine, "sl_params", None)
+    if not isinstance(sl, dict):
+        raise RuntimeError("engine.sl_params is missing after monitor param injection")
+
+    missing_engine_sl = [k for k, v in params.items() if sl.get(k) != v]
+    if missing_engine_sl:
+        raise RuntimeError(f"monitor params not applied to engine.sl_params: {missing_engine_sl}")
+
+    cfg = getattr(engine, "cfg", None)
+    if not isinstance(cfg, dict):
+        raise RuntimeError("engine.cfg is missing or invalid after monitor param injection")
+
+    ss = cfg.get("system_settings", None)
+    if not isinstance(ss, dict):
+        raise RuntimeError('engine.cfg["system_settings"] is missing after monitor param injection')
+
+    cfg_sl = ss.get("sl_params", None)
+    if not isinstance(cfg_sl, dict):
+        raise RuntimeError('engine.cfg["system_settings"]["sl_params"] is missing after monitor param injection')
+
+    missing_cfg_sl = [k for k, v in params.items() if cfg_sl.get(k) != v]
+    if missing_cfg_sl:
+        raise RuntimeError(
+            'monitor params not applied to engine.cfg["system_settings"]["sl_params"]: '
+            f"{missing_cfg_sl}"
+        )
+
+def _upsert_monitor_dict(owner, attr_name: str, monitor_params: dict):
+    """
+    owner.attr_name 이 dict면 update,
+    없거나 None이면 새 dict로 생성해서 주입
+    """
+    if owner is None:
+        return
+
+    cur = getattr(owner, attr_name, None)
+    if isinstance(cur, dict):
+        cur.update(monitor_params)
+    else:
+        setattr(owner, attr_name, dict(monitor_params))
+
+
+def _upsert_monitor_config(owner, monitor_params: dict):
+    """
+    owner.config 가 dict면 monitor 관련 dict를 강제로 생성/업데이트
+    """
+    if owner is None:
+        return
+
+    cfg = getattr(owner, "config", None)
+    if not isinstance(cfg, dict):
+        return
+
+    for key in ("sl_params", "position_monitor_params", "monitor_params", "exit_params"):
+        if isinstance(cfg.get(key), dict):
+            cfg[key].update(monitor_params)
+        else:
+            cfg[key] = dict(monitor_params)
+
+
+def _upsert_position_monitor(owner, monitor_params: dict):
+    """
+    owner.position_monitor.params 도 강제로 생성/업데이트
+    """
+    if owner is None:
+        return
+
+    pm = getattr(owner, "position_monitor", None)
+    if pm is None:
+        return
+
+    cur = getattr(pm, "params", None)
+    if isinstance(cur, dict):
+        cur.update(monitor_params)
+    else:
+        setattr(pm, "params", dict(monitor_params))
+
+def _apply_monitor_params(engine, monitor_params: dict):
+    """
+    전략 파라미터는 엔진 기본값 유지.
+    emergency monitor params는 실제 실행 경로 전반에 강제 주입.
+    """
+    titan = getattr(engine, "titan", None)
+
+    strategy_params = dict(getattr(titan, "params", {})) if titan is not None else {}
+    _validate_param_keys(engine, strategy_params)
+
+    if titan is not None and hasattr(titan, "set_params"):
+        titan.set_params(strategy_params)
+
+    _force_apply_monitor_params(engine, monitor_params)
+    _assert_monitor_params_applied(engine, monitor_params)
 
 def _build_params_for_trial(trial) -> dict:
     """
-    titan_strategy_20260307.py의 실제 유효 파라미터만 탐색
+    전략 파라미터는 건드리지 않고,
+    PositionMonitor emergency 파라미터만 최적화
     """
-    params = {
-        # --------------------------------------------------
-        # Core
-        # --------------------------------------------------
-        "atr_period": trial.suggest_int("atr_period", 10, 24),
-        "atr_multiplier": trial.suggest_float("atr_multiplier", 1.75, 3.50, step=0.25),
+    params = _fixed_monitor_params()
 
-        # --------------------------------------------------
-        # Filters
-        # --------------------------------------------------
-        "adx_threshold": trial.suggest_int("adx_threshold", 4, 24, step=2),
-        "daily_ema": trial.suggest_int("daily_ema", 10, 30, step=5),
+    em_giveback = trial.suggest_float("emergency_giveback_atr", 0.60, 1.80, step=0.10)
+    em_hard = trial.suggest_float("emergency_giveback_hard_atr", 0.80, 2.80, step=0.10)
 
-        # --------------------------------------------------
-        # Structure / Retest geometry
-        # --------------------------------------------------
-        "swing_len": trial.suggest_int("swing_len", 3, 7, step=1),
-        "context_lookback": trial.suggest_int("context_lookback", 45, 150, step=15),
-        "retest_tolerance_atr": trial.suggest_float("retest_tolerance_atr", 0.20, 0.60, step=0.05),
-        "structure_min_pivots": trial.suggest_int("structure_min_pivots", 2, 3, step=1),
-    }
+    # hard가 soft보다 작아지지 않게 보정
+    if em_hard <= em_giveback:
+        em_hard = round(em_giveback + 0.20, 2)
 
-    params.update(_fixed_strategy_params())
+    params.update({
+        "emergency_mfe_min_atr": trial.suggest_float("emergency_mfe_min_atr", 0.75, 3.00, step=0.25),
+        "emergency_giveback_atr": em_giveback,
+        "emergency_giveback_hard_atr": em_hard,
+        "emergency_swing_len": trial.suggest_int("emergency_swing_len", 3, 9, step=1),
+        "emergency_structure_buffer_atr": trial.suggest_float("emergency_structure_buffer_atr", 0.00, 0.80, step=0.05),
+        "emergency_structure_confirm_atr": trial.suggest_float("emergency_structure_confirm_atr", 0.00, 0.60, step=0.05),
+        "emergency_profit_lock_atr": trial.suggest_float("emergency_profit_lock_atr", 0.00, 0.80, step=0.05),
+        "fee_buffer_bps": trial.suggest_float("fee_buffer_bps", 0.0, 10.0, step=1.0),
+    })
+
     return params
+
 
 
 def _validate_param_keys(engine, params: dict):
@@ -425,18 +607,22 @@ def _clone_cache_into_engine(engine, frozen_snapshot: dict):
 def objective(trial, frozen_snapshot, result_csv_path: str):
     """
     최적화 타깃은 Final Equity 고정
+    전략 파라미터는 엔진 기본값 유지
+    emergency monitor 파라미터만 trial 적용
     """
     engine = BacktestEngine(days=OPT_DAYS)
     _clone_cache_into_engine(engine, frozen_snapshot)
 
     params = _build_params_for_trial(trial)
-    _validate_param_keys(engine, params)
-
-    engine.titan.set_params(params)
+    _apply_monitor_params(engine, params)
     redirect_trial_outputs(engine, result_csv_path)
 
     try:
         engine.rebuild_indicators()
+
+        # rebuild 후 다시 강제 주입
+        _apply_monitor_params(engine, params)
+
         engine.run(show_report=False)
     except Exception:
         return -1e9
@@ -481,8 +667,7 @@ def run_one_and_export(frozen_snapshot, params: dict, out_dir: str, tag: str, da
     engine = BacktestEngine(days=days)
     _clone_cache_into_engine(engine, frozen_snapshot)
 
-    _validate_param_keys(engine, params)
-    engine.titan.set_params(params)
+    _apply_monitor_params(engine, params)
 
     if hasattr(engine, "log_file"):
         engine.log_file = hist_path
@@ -502,6 +687,10 @@ def run_one_and_export(frozen_snapshot, params: dict, out_dir: str, tag: str, da
             ex.equity_curve_file = curve_path
 
     engine.rebuild_indicators()
+
+    # rebuild 후 다시 강제 주입
+    _apply_monitor_params(engine, params)
+
     engine.run(show_report=False)
 
     metrics = calculate_metrics(INITIAL_BALANCE, engine) or {}
@@ -514,7 +703,6 @@ def run_one_and_export(frozen_snapshot, params: dict, out_dir: str, tag: str, da
 
     return metrics
 
-
 def _extract_params_from_row(row: pd.Series) -> dict:
     def _to_int(x, default=0):
         if pd.isna(x):
@@ -526,21 +714,24 @@ def _extract_params_from_row(row: pd.Series) -> dict:
             return float(default)
         return float(x)
 
-    params = _fixed_strategy_params()
+    params = _fixed_monitor_params()
 
     params.update({
-        "atr_period": _to_int(row.get("atr_period"), 16),
-        "atr_multiplier": _to_float(row.get("atr_multiplier"), 2.25),
-        "adx_threshold": _to_int(row.get("adx_threshold"), 12),
-        "daily_ema": _to_int(row.get("daily_ema"), 15),
-
-        "swing_len": _to_int(row.get("swing_len"), 3),
-        "context_lookback": _to_int(row.get("context_lookback"), 60),
-        "retest_tolerance_atr": _to_float(row.get("retest_tolerance_atr"), 0.35),
-        "structure_min_pivots": _to_int(row.get("structure_min_pivots"), 2),
+        "emergency_mfe_min_atr": _to_float(row.get("emergency_mfe_min_atr"), 1.5),
+        "emergency_giveback_atr": _to_float(row.get("emergency_giveback_atr"), 1.0),
+        "emergency_giveback_hard_atr": _to_float(row.get("emergency_giveback_hard_atr"), 1.7),
+        "emergency_swing_len": _to_int(row.get("emergency_swing_len"), 5),
+        "emergency_structure_buffer_atr": _to_float(row.get("emergency_structure_buffer_atr"), 0.3),
+        "emergency_structure_confirm_atr": _to_float(row.get("emergency_structure_confirm_atr"), 0.0),
+        "emergency_profit_lock_atr": _to_float(row.get("emergency_profit_lock_atr"), 0.2),
+        "fee_buffer_bps": _to_float(row.get("fee_buffer_bps"), 0.0),
     })
 
+    if params["emergency_giveback_hard_atr"] <= params["emergency_giveback_atr"]:
+        params["emergency_giveback_hard_atr"] = round(params["emergency_giveback_atr"] + 0.20, 2)
+
     return params
+
 
 
 # ------------------------------------------------------------
@@ -681,16 +872,14 @@ def main():
         dfv.to_csv(os.path.join(reports_dir, f"top5_{v}.csv"), index=False, encoding="utf-8-sig")
 
     # Best / baseline
-    best_params = _fixed_strategy_params()
+    best_params = _fixed_monitor_params()
     best_params.update(dict(study.best_trial.params))
+    if best_params["emergency_giveback_hard_atr"] <= best_params["emergency_giveback_atr"]:
+        best_params["emergency_giveback_hard_atr"] = round(best_params["emergency_giveback_atr"] + 0.20, 2)
+
     best_dir = ensure_dir(os.path.join(reports_dir, "best"))
 
-    base_engine = BacktestEngine(days=OPT_DAYS)
-    baseline_params = dict(getattr(base_engine.titan, "params", {}))
-    baseline_params.update(_fixed_strategy_params())
-
-    keep_keys = set(_extract_params_from_row(pd.Series({})).keys())
-    baseline_params = {k: baseline_params[k] for k in keep_keys if k in baseline_params}
+    baseline_params = _fixed_monitor_params()
 
     baseline_dir = ensure_dir(os.path.join(reports_dir, "baseline"))
 

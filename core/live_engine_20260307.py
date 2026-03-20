@@ -21,6 +21,7 @@
 # - UPDATE_SL (옵션) / EXIT
 # =========================================================
 
+from operator import pos
 import sys
 import os
 import json
@@ -31,7 +32,6 @@ import pandas as pd
 import pandas_ta as ta
 import urllib.parse
 import urllib.request
-
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "phalanx_live.log")
 LOG_PATH = os.path.abspath(LOG_PATH)
@@ -67,7 +67,7 @@ class TelegramNotifier:
       - telegram_token / telegram_chat_id
       - system_settings:
           telegram_enabled (optional)
-          telegram_send_update_sl (default True)
+          telegram_send_update_sl (default False)
           telegram_send_heartbeat (default False)
           telegram_tag (default 'PHALANX')
           telegram_dedup_window_sec (default 15)
@@ -1597,10 +1597,9 @@ class LiveEngine:
         - 실패하면 기존 validated_map 유지
 
         정합 강화:
-        - 15m intraday 지표 웜업 목적의 최소 히스토리만 보장
-        - DAILY EMA는 1D 캐시(raw_daily_map)에서 별도 주입되므로
-        15m 기준 40일치(40*96봉) 강제는 제거
-        - 단일 fetch(limit=want)의 거래소 제한을 피하기 위해 pagination으로 누적 fetch
+        - EMA200/ATR(SuperTrend) 웜업을 위해 최소 600봉 강제
+        - DAILY EMA용 최소 40일봉 보장을 위해 15m 기준 최소 40*96봉 강제
+        - 단일 fetch(limit=want) 의 거래소 제한을 피하기 위해 pagination으로 누적 fetch
         """
         out = dict(validated_map or {})
 
@@ -1618,12 +1617,21 @@ class LiveEngine:
             except Exception:
                 p = {}
 
-            # ✅ intraday warmup만 보장
-            # - min_bars: 엔진 호출부 요구치
-            # - 600봉: EMA/ATR/ST/ADX 등 15m 지표 안정화용 하한
+            # DAILY EMA는 전략에서 15m -> D resample로 계산하므로
+            # 최소 40일봉 보장을 위해 15m 기준 40*96 봉을 강제
+            try:
+                daily_ema_len = int(p.get("daily_ema", 25) or 25)
+            except Exception:
+                daily_ema_len = 25
+
+            daily_need_days = max(40, daily_ema_len + 5)   # 최소 40일, 전략 최소요구(daily_ema+5)도 반영
+            bars_per_day_15m = int((24 * 60) // 15)        # 96
+            daily_need_15m = int(daily_need_days * bars_per_day_15m)
+
             want = int(min_bars or 0)
-            want = max(want, 600)
-            want = want + 50  # 여유분(누락/정렬/지표계산)
+            want = max(want, 600)           # intraday warmup
+            want = max(want, daily_need_15m)
+            want = want + 50                # 여유분(누락/정렬/지표계산)
 
             tf_ms = int(self.tf15_sec * 1000)
             batch_limit = 1500  # Binance/CCXT 일반 제한 대응
@@ -1713,6 +1721,7 @@ class LiveEngine:
             return out
 
         return out
+
 
     # -----------------------------------------------------
     # Time / Loop Authority
@@ -2037,7 +2046,7 @@ class LiveEngine:
         except Exception:
             daily_len = 25
 
-        need_days = int(max(100, daily_len * 4))
+        need_days = int(max(40, daily_len + 5))
         loaded = 0
 
         stats = {
@@ -2063,7 +2072,7 @@ class LiveEngine:
                     continue
 
                 end_dt = pd.Timestamp(df15.index.max()).normalize() + pd.Timedelta(days=1)
-                since_dt = end_dt - pd.Timedelta(days=int(need_days + 30))
+                since_dt = end_dt - pd.Timedelta(days=int(need_days + 5))
 
                 since_ms = int(pd.Timestamp(since_dt).timestamp() * 1000)
                 until_ms = int(pd.Timestamp(end_dt).timestamp() * 1000)
@@ -2150,7 +2159,7 @@ class LiveEngine:
         except Exception:
             daily_len = 25
 
-        need_days = int(max(100, daily_len * 4))
+        need_days = int(max(40, daily_len + 5))
 
         dfd = getattr(self, "raw_daily_map", {}).get(sym)
         if dfd is None or dfd.empty:
@@ -2940,46 +2949,6 @@ class LiveEngine:
             pass
 
         return float(px)
-
-    def _resolve_update_sl_display(self, pos: dict, apply_mode: str, fallback_new_sl=None) -> dict:
-        """
-        UPDATE_SL 표시/기록용 SL 선택
-        - same 모드: active SL(pos['sl'])
-        - next 모드: 예약된 next_sl(pos['next_sl'])
-        """
-        def _sf(x):
-            try:
-                v = float(x)
-                if not math.isfinite(v) or v <= 0:
-                    return None
-                return float(v)
-            except Exception:
-                return None
-
-        mode = str(apply_mode or "same").strip().lower()
-        if mode not in ("same", "next"):
-            mode = "same"
-
-        current_sl = _sf((pos or {}).get("sl"))
-        next_sl = _sf((pos or {}).get("next_sl"))
-        fb_sl = _sf(fallback_new_sl)
-
-        if mode == "next":
-            display_sl = next_sl if next_sl is not None else (fb_sl if fb_sl is not None else current_sl)
-            target = "NEXT_SL"
-        else:
-            display_sl = current_sl if current_sl is not None else fb_sl
-            target = "ACTIVE_SL"
-
-        return {
-            "mode": mode,
-            "target": target,
-            "display_sl": display_sl,
-            "current_sl": current_sl,
-            "next_sl": next_sl,
-        }
-
-
     # -----------------------------------------------------
     # Candle Picking (15m stale blocking fix)
     # -----------------------------------------------------
@@ -3263,13 +3232,14 @@ class LiveEngine:
     # - placement: right after def _diagnose_retest(...)
     # -----------------------------------------------------
     def _debug_analyze_result(self, sym: str, past_data: pd.DataFrame,
-                            signal, sl, tp,
-                            max_samples: int = 2):
+                              signal, sl, tp,
+                              max_samples: int = 2):
         """
-        ✅ Titan 8.2.1-LiquidityMSSPullback-VolScoreOnly 기준 최종 반환값 디버그
-        - continuation/pullback 잔재 제거
-        - MSS / retest / volume-score / daily / ST 기준으로 스냅샷 출력
+        ✅ analyze() 최종 반환값을 구조적으로 출력
+        - 1~2개 심볼만 샘플로 찍음 (과도한 로그 방지)
+        - 왜 signal=None 인지 gate 관점 + retest 관점 함께 출력
         """
+
         try:
             dbg_cnt = getattr(self, "_analyze_dbg_count", 0)
         except Exception:
@@ -3280,6 +3250,7 @@ class LiveEngine:
 
         try:
             curr = past_data.iloc[-1]
+            prev = past_data.iloc[-2] if len(past_data) >= 2 else None
         except Exception:
             return
 
@@ -3297,36 +3268,15 @@ class LiveEngine:
                 return None
 
         snapshot = {
-            # price / base indicators
             "close": _f(curr.get("close")),
             "high": _f(curr.get("high")),
             "low": _f(curr.get("low")),
             "atr": _f(curr.get("atr")),
             "adx": _f(curr.get("adx")),
-            "ema_intra": _f(curr.get("ema_intra")),
-            "ema_daily": _f(curr.get("ema_daily")),
-            "ema_daily_ok": _i(curr.get("ema_daily_ok")),
             "st_dir": _i(curr.get("st_dir")),
             "st_val": _f(curr.get("st_val")),
-
-            # volume score only
-            "vol_ratio_prev": _f(curr.get("vol_ratio_prev")),
-            "vol_score_prev": _f(curr.get("vol_score_prev")),
-            "vol_ok_like_prev": _i(curr.get("vol_ok_like_prev")),
-
-            # liquidity / MSS / retest
-            "sweep_high": _i(curr.get("sweep_high")),
-            "sweep_low": _i(curr.get("sweep_low")),
-            "recent_sweep_high": _i(curr.get("recent_sweep_high")),
-            "recent_sweep_low": _i(curr.get("recent_sweep_low")),
-            "mss_up_trigger": _i(curr.get("mss_up_trigger")),
-            "mss_down_trigger": _i(curr.get("mss_down_trigger")),
-            "mss_age_up": _f(curr.get("mss_age_up")),
-            "mss_age_down": _f(curr.get("mss_age_down")),
-            "mss_active_up": _i(curr.get("mss_active_up")),
-            "mss_active_down": _i(curr.get("mss_active_down")),
-            "mss_level_up": _f(curr.get("mss_level_up")),
-            "mss_level_down": _f(curr.get("mss_level_down")),
+            "lvl_up": _f(curr.get("mss_level_up")),
+            "lvl_dn": _f(curr.get("mss_level_down")),
             "retest_long": _i(curr.get("retest_long")),
             "retest_short": _i(curr.get("retest_short")),
         }
@@ -3343,9 +3293,6 @@ class LiveEngine:
             pass
 
 
-
-
-
     # =========================================================
     # [MOD] _compute_candidates_15m() 내부 교체 패치
     # - "idx/get_loc + iloc[:idx+1] + _slice_for_strategy" 제거
@@ -3353,10 +3300,19 @@ class LiveEngine:
     # =========================================================
     def _compute_candidates_15m(self, current_time_15m, symbols=None):
         """
-        ✅ Titan 8.2.1-LiquidityMSSPullback-VolScoreOnly 기준 후보 계산
-        - analyze()는 MSS + retest + daily/ADX/ST 를 그대로 사용
-        - 후보 우선순위(score)는 adx가 아니라 vol_score_prev 사용
-        - debug_entry_trace 시 strategy-aligned gate trace 출력
+        ✅ candidates 계산도 '동일 캔들 active_symbols' 기준으로만 수행
+        + debug_entry_trace 시, 지표/게이트 분해 로그를 남겨 '왜 no_signal인지' 즉시 판별
+        + ✅ retest=0 원인(=retest 계산식 관점 실패 요인)까지 분해 로그 추가
+
+        ✅ 심볼 정합성 강화:
+        - symbols 입력을 state 표준키(XXX/USDT:USDT)로 강제 정규화
+        - data_map 키와 안 맞아 후보가 조용히 탈락하는 케이스를 차단
+
+        ✅ Titan 8.3.0 정합:
+        - MSS 키(mss_*) 제거 → CHOCH 키(choch_*) 사용
+        - Volume gate 제거(전략은 score-only)
+        - ATR Volatility Regime Gate(atr_ratio/atr_up) 반영
+        - BOS(=bos_ok_long/short) + Daily + ADX(optional) + ST filter 로직을 전략과 동일하게 trace
         """
 
         def _canon(sym: str) -> str:
@@ -3385,6 +3341,7 @@ class LiveEngine:
         if not syms_in:
             return candidates
 
+        # ✅ 입력 심볼 표준화 + 중복 제거 (순서 유지)
         syms = []
         seen = set()
         for s in syms_in:
@@ -3423,95 +3380,174 @@ class LiveEngine:
             except Exception:
                 return default
 
-        def _snap_safe(curr):
+        def _snap_safe(curr, prev=None):
+            """
+            ✅ Titan 8.3.0 컬럼 스냅샷(CHOCH/BOS/ATR Regime 포함)
+            """
             try:
                 return {
-                    "close": _f(curr.get("close"), None),
-                    "open": _f(curr.get("open"), None),
-                    "high": _f(curr.get("high"), None),
-                    "low": _f(curr.get("low"), None),
-                    "atr": _f(curr.get("atr"), None),
-                    "adx": _f(curr.get("adx"), None),
-                    "ema_intra": _f(curr.get("ema_intra"), None),
-                    "ema_daily": _f(curr.get("ema_daily"), None),
-                    "ema_daily_ok": _i(curr.get("ema_daily_ok"), None),
-                    "st_dir": _i(curr.get("st_dir"), None),
-                    "st_val": _f(curr.get("st_val"), None),
+                    "close": _f(curr.get("close", None), None),
+                    "open": _f(curr.get("open", None), None),
+                    "high": _f(curr.get("high", None), None),
+                    "low": _f(curr.get("low", None), None),
+                    "volume": _f(curr.get("volume", None), None),
 
-                    "vol_ratio_prev": _f(curr.get("vol_ratio_prev"), None),
-                    "vol_score_prev": _f(curr.get("vol_score_prev"), None),
-                    "vol_ok_like_prev": _i(curr.get("vol_ok_like_prev"), None),
+                    "adx": _f(curr.get("adx", None), None),
+                    "rsi": _f(curr.get("rsi", None), None),
+                    "atr": _f(curr.get("atr", None), None),
 
-                    "recent_sweep_high": _i(curr.get("recent_sweep_high"), None),
-                    "recent_sweep_low": _i(curr.get("recent_sweep_low"), None),
-                    "mss_up_trigger": _i(curr.get("mss_up_trigger"), None),
-                    "mss_down_trigger": _i(curr.get("mss_down_trigger"), None),
-                    "mss_active_up": _i(curr.get("mss_active_up"), None),
-                    "mss_active_down": _i(curr.get("mss_active_down"), None),
-                    "mss_level_up": _f(curr.get("mss_level_up"), None),
-                    "mss_level_down": _f(curr.get("mss_level_down"), None),
-                    "retest_long": _i(curr.get("retest_long"), None),
-                    "retest_short": _i(curr.get("retest_short"), None),
+                    # volume score-only (전략은 gate 아님)
+                    "vol_ma_prev": _f(prev.get("vol_ma", None), None) if isinstance(prev, pd.Series) else None,
+                    "vol_ratio_prev": _f(curr.get("vol_ratio_prev", None), None),
+                    "vol_score_prev": _f(curr.get("vol_score_prev", None), None),
+
+                    "ema_intra": _f(curr.get("ema_intra", None), None),
+                    "ema_daily": _f(curr.get("ema_daily", None), None),
+                    "ema_daily_ok": _i(curr.get("ema_daily_ok", None), None),
+
+                    "st_dir": _i(curr.get("st_dir", None), None),
+                    "st_val": _f(curr.get("st_val", None), None),
+
+                    # sweep context
+                    "recent_sweep_high": _i(curr.get("recent_sweep_high", None), None),
+                    "recent_sweep_low": _i(curr.get("recent_sweep_low", None), None),
+
+                    # ✅ CHOCH (NOT MSS)
+                    "choch_up_trigger": _i(curr.get("choch_up_trigger", None), None),
+                    "choch_down_trigger": _i(curr.get("choch_down_trigger", None), None),
+                    "choch_active_up": _i(curr.get("choch_active_up", None), None),
+                    "choch_active_down": _i(curr.get("choch_active_down", None), None),
+                    "choch_level_up": _f(curr.get("choch_level_up", None), None),
+                    "choch_level_down": _f(curr.get("choch_level_down", None), None),
+
+                    # ✅ BOS / Trend state
+                    "trend_state": _i(curr.get("trend_state", None), None),
+                    "bos_ok_long": _i(curr.get("bos_ok_long", None), None),
+                    "bos_ok_short": _i(curr.get("bos_ok_short", None), None),
+
+                    # ✅ Retest flags
+                    "retest_long": _i(curr.get("retest_long", None), None),
+                    "retest_short": _i(curr.get("retest_short", None), None),
+
+                    # ✅ ATR Regime Gate inputs
+                    "atr_ma": _f(curr.get("atr_ma", None), None),
+                    "atr_ratio": _f(curr.get("atr_ratio", None), None),
+                    "atr_up": _i(curr.get("atr_up", None), None),
                 }
             except Exception:
                 return {}
 
-        def _gate_trace(curr):
+        def _gate_trace(curr, prev):
+            """
+            ✅ TitanStrategy.analyze()와 동일한 논리로 gate를 재계산해서 로그에 찍는다.
+            (디버그용이며, 실제 후보 생성/신호는 titan.analyze() 리턴을 그대로 사용)
+            """
             try:
                 p = getattr(self.titan, "params", {}) or {}
 
-                close = _f(curr.get("close"), 0.0)
-                adx = _f(curr.get("adx"), 0.0)
-                ema_daily = _f(curr.get("ema_daily"), None)
-                ema_daily_ok = (_i(curr.get("ema_daily_ok"), 0) == 1)
-
+                # --- strategy switches ---
                 use_daily = bool(p.get("use_daily_filter", True))
-                adx_threshold = float(p.get("adx_threshold", 0) or 0)
-                adx_filter_on = adx_threshold > 0
+                use_st = bool(p.get("use_st_dir_filter", True))
+                use_structure = bool(p.get("use_structure_confirm", True))
+                use_vol_regime = bool(p.get("use_vol_regime_gate", True))
+                atr_slope_gate = bool(p.get("atr_slope_gate", True))
 
-                daily_up = (close > ema_daily) if (use_daily and ema_daily_ok and ema_daily is not None) else True
-                daily_dn = (close < ema_daily) if (use_daily and ema_daily_ok and ema_daily is not None) else True
-                adx_ok = (adx > adx_threshold) if adx_filter_on else True
+                adx_th = float(p.get("adx_threshold", 0) or 0)
+                adx_filter_on = adx_th > 0
 
-                retest_long = (_i(curr.get("retest_long"), 0) == 1)
-                retest_short = (_i(curr.get("retest_short"), 0) == 1)
+                close = float(curr.get("close", 0) or 0)
+                open_ = float(curr.get("open", close) or close)
 
-                lvl_up = _f(curr.get("mss_level_up"), None)
-                lvl_dn = _f(curr.get("mss_level_down"), None)
-                level_ok = ((lvl_up is not None and lvl_up > 0) or (lvl_dn is not None and lvl_dn > 0))
+                # --- Daily filter ---
+                daily_ok = int(curr.get("ema_daily_ok", 0) or 0) == 1
+                ema_daily = float(curr.get("ema_daily", 0) or 0)
+                is_daily_up = (close > ema_daily) if (use_daily and daily_ok) else True
+                is_daily_dn = (close < ema_daily) if (use_daily and daily_ok) else True
 
+                # --- ADX (optional gate) ---
+                adx = float(curr.get("adx", 0) or 0)
+                is_trend_alive = (adx > adx_th) if adx_filter_on else True
+
+                # --- Volatility regime gate (ATR 기반) ---
+                vol_gate_ok = True
+                atr_ratio = float(curr.get("atr_ratio", 0.0) or 0.0)
+                need = float(p.get("atr_regime_factor", 1.0) or 1.0)
+                if use_vol_regime:
+                    vol_gate_ok = (atr_ratio > need)
+                    if atr_slope_gate:
+                        vol_gate_ok = vol_gate_ok and (int(curr.get("atr_up", 0) or 0) == 1)
+
+                # --- Level / Retest ---
+                retest_long = int(curr.get("retest_long", 0) or 0) == 1
+                retest_short = int(curr.get("retest_short", 0) or 0) == 1
+
+                lvl_up = curr.get("choch_level_up", None)
+                lvl_dn = curr.get("choch_level_down", None)
+                level_ok = (
+                    (lvl_up is not None and pd.notna(lvl_up) and float(lvl_up) > 0)
+                    or (lvl_dn is not None and pd.notna(lvl_dn) and float(lvl_dn) > 0)
+                )
+
+                # --- BOS confirm (strategy와 동일) ---
+                bos_ok_long = (int(curr.get("bos_ok_long", 0) or 0) == 1) if use_structure else True
+                bos_ok_short = (int(curr.get("bos_ok_short", 0) or 0) == 1) if use_structure else True
+
+                # --- Pre signal (strategy 동일) ---
                 pre_sig = None
-                if level_ok:
-                    if retest_long and daily_up and adx_ok:
-                        pre_sig = "LONG"
-                    elif retest_short and daily_dn and adx_ok:
-                        pre_sig = "SHORT"
+                if level_ok and vol_gate_ok:
+                    if retest_long and is_daily_up and bos_ok_long:
+                        if (not adx_filter_on) or is_trend_alive:
+                            pre_sig = "LONG"
+                    elif retest_short and is_daily_dn and bos_ok_short:
+                        if (not adx_filter_on) or is_trend_alive:
+                            pre_sig = "SHORT"
 
+                # --- ST filter (strategy 동일) ---
                 post_sig = pre_sig
-                if pre_sig is not None and bool(p.get("use_st_dir_filter", True)):
-                    st_dir = _i(curr.get("st_dir"), 0)
-                    st_val = _f(curr.get("st_val"), None)
+                if pre_sig is not None and use_st:
+                    st_dir = int(curr.get("st_dir", 0) or 0)
+                    st_val = curr.get("st_val", None)
+                    st_val_f = None
+                    try:
+                        st_val_f = float(st_val) if (st_val is not None and math.isfinite(float(st_val))) else None
+                    except Exception:
+                        st_val_f = None
 
                     if pre_sig == "LONG":
-                        if (st_dir is None or st_dir <= 0) or (st_val is not None and st_val >= close):
+                        if (st_dir <= 0) or (st_val_f is not None and st_val_f >= close):
                             post_sig = None
-                    else:
-                        if (st_dir is None or st_dir >= 0) or (st_val is not None and st_val <= close):
+                    else:  # SHORT
+                        if (st_dir >= 0) or (st_val_f is not None and st_val_f <= close):
                             post_sig = None
 
                 return {
-                    "daily_up": int(bool(daily_up)),
-                    "daily_dn": int(bool(daily_dn)),
-                    "adx_ok": int(bool(adx_ok)),
                     "level_ok": int(bool(level_ok)),
-                    "retest_long": int(bool(retest_long)),
-                    "retest_short": int(bool(retest_short)),
-                    "mss_up": int(_i(curr.get("mss_up_trigger"), 0) == 1),
-                    "mss_dn": int(_i(curr.get("mss_down_trigger"), 0) == 1),
-                    "vol_ok_like": int(_i(curr.get("vol_ok_like_prev"), 0) == 1),
-                    "vol_score": _f(curr.get("vol_score_prev"), 0.0),
+                    "retestL": int(bool(retest_long)),
+                    "retestS": int(bool(retest_short)),
+
+                    "daily_ok": int(bool(daily_ok)) if use_daily else -1,
+                    "daily_up": int(bool(is_daily_up)),
+                    "daily_dn": int(bool(is_daily_dn)),
+
+                    "adx_on": int(bool(adx_filter_on)),
+                    "adx_ok": int(bool(is_trend_alive)),
+
+                    # ✅ volatility regime gate 상태를 명시
+                    "vol_reg_on": int(bool(use_vol_regime)),
+                    "atr_ratio": float(atr_ratio),
+                    "atr_need": float(need),
+                    "atr_up": int(curr.get("atr_up", 0) or 0),
+                    "vol_gate_ok": int(bool(vol_gate_ok)),
+
+                    # ✅ BOS 상태를 명시
+                    "bos_on": int(bool(use_structure)),
+                    "bosL": int(bool(bos_ok_long)),
+                    "bosS": int(bool(bos_ok_short)),
+
                     "pre_sig": pre_sig,
+                    "st_filter_on": int(bool(use_st)),
                     "post_sig": post_sig,
+                    "close>open": int(bool(close > open_)),
                 }
             except Exception:
                 return {}
@@ -3519,6 +3555,7 @@ class LiveEngine:
         min_len = int(self._t9_min_len())
 
         for sym in syms:
+            # ✅ cooldown gate (Backtest 동일) - 키 표준화 후 체크
             if self._is_in_cooldown(sym, current_time_15m):
                 if debug_entry:
                     try:
@@ -3547,12 +3584,29 @@ class LiveEngine:
             if debug_entry:
                 try:
                     curr_dbg = past_data.iloc[-1]
-                    snap0 = _snap_safe(curr_dbg)
-                    gate0 = _gate_trace(curr_dbg)
-                    logger.info(
-                        f"🧪 PRE_ANALYZE | {sym} t={current_time_15m} rows={len(past_data)} "
-                        f"snap={snap0} gate={gate0}"
-                    )
+                    prev_dbg = past_data.iloc[-2]
+                    snap0 = _snap_safe(curr_dbg, prev_dbg)
+                    gate0 = _gate_trace(curr_dbg, prev_dbg)
+
+                    diag = self._diagnose_retest(sym, past_data)
+                    rl0 = (int(diag.get("obs", {}).get("retest_long", 0)) == 0)
+                    rs0 = (int(diag.get("obs", {}).get("retest_short", 0)) == 0)
+
+                    if rl0 or rs0:
+                        logger.info(
+                            f"🧪 PRE_ANALYZE | {sym} t={current_time_15m} rows={len(past_data)} "
+                            f"snap={snap0} gate={gate0} "
+                            f"retest_diag={{"
+                            f"'obs':{diag.get('obs')},"
+                            f"'calc':{diag.get('calc')},"
+                            f"'params':{diag.get('params')},"
+                            f"'inputs':{diag.get('inputs')},"
+                            f"'why0':{diag.get('why0')},"
+                            f"'mismatch':{diag.get('mismatch')}"
+                            f"}}"
+                        )
+                    else:
+                        logger.info(f"🧪 PRE_ANALYZE | {sym} t={current_time_15m} rows={len(past_data)} snap={snap0} gate={gate0}")
                 except Exception:
                     pass
 
@@ -3574,6 +3628,7 @@ class LiveEngine:
 
             had_signal += 1
 
+            # ✅ loc는 KeyError 가능 -> 심볼/시간 불일치시 candidates에 넣지 않음
             try:
                 curr_row = df.loc[current_time_15m]
             except Exception:
@@ -3581,34 +3636,22 @@ class LiveEngine:
                 continue
 
             try:
-                score = curr_row.get("vol_score_prev", 0.0)
-                score = float(score) if score is not None and math.isfinite(float(score)) else 0.0
+                score = curr_row.get("adx", 0)
+                score = float(score) if score is not None else 0.0
             except Exception:
                 score = 0.0
 
             candidates.append({
                 "score": float(score),
-                "sym": sym,
-                "signal": signal,
+                "sym": sym,               # ✅ 표준키만 들어감
+                "signal": signal,         # ✅ Titan analyze 리턴 그대로 사용
                 "sl": sl,
                 "tp": tp,
                 "row": curr_row,
             })
 
             try:
-                vol_ratio = curr_row.get("vol_ratio_prev", None)
-                vol_ratio = float(vol_ratio) if vol_ratio is not None and math.isfinite(float(vol_ratio)) else None
-
-                if vol_ratio is None:
-                    logger.info(
-                        f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} "
-                        f"vol_score={score:.4f} sl={sl} tp={tp}"
-                    )
-                else:
-                    logger.info(
-                        f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} "
-                        f"vol_score={score:.4f} vol_ratio={vol_ratio:.4f} sl={sl} tp={tp}"
-                    )
+                logger.info(f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} adx={score:.2f} sl={sl} tp={tp}")
             except Exception:
                 logger.info(f"🟢 ENTRY_CANDIDATE | {sym} signal={signal} sl={sl} tp={tp}")
 
@@ -3622,7 +3665,6 @@ class LiveEngine:
             )
 
         return candidates
-
 
 
     # -----------------------------------------------------
@@ -4287,9 +4329,6 @@ class LiveEngine:
 
         ✅ entry_price 복구:
         - 기존 포지션에 entry_price가 비어 있으면 주문조회/실포지션조회로 보강 시도
-
-        ✅ UPDATE_SL 표시/기록 수정:
-        - next 모드에서는 active sl이 아니라 예약된 next_sl을 기록/알림
         """
         pos = self.executor.positions.get(sym)
         if not pos:
@@ -4522,14 +4561,6 @@ class LiveEngine:
                 pass
 
         if action == "UPDATE_SL":
-            display = {
-                "mode": apply_mode,
-                "target": "ACTIVE_SL",
-                "display_sl": None,
-                "current_sl": None,
-                "next_sl": None,
-            }
-
             try:
                 if new_sl is not None:
                     new_sl_f = float(new_sl)
@@ -4555,29 +4586,10 @@ class LiveEngine:
                             pos["next_sl"] = None
                             pos["next_sl_bucket"] = None
                             self._save_state()
-
-                display = self._resolve_update_sl_display(
-                    pos=pos,
-                    apply_mode=apply_mode,
-                    fallback_new_sl=new_sl,
-                )
             except Exception:
                 pass
 
             try:
-                reason_txt = str(reason or "TRAILING")
-                if display["mode"] == "next":
-                    reason_txt = (
-                        f"{reason_txt} | target=NEXT_SL "
-                        f"| current_sl={display['current_sl']} "
-                        f"| next_sl={display['next_sl']}"
-                    )
-                else:
-                    reason_txt = (
-                        f"{reason_txt} | target=ACTIVE_SL "
-                        f"| current_sl={display['current_sl']}"
-                    )
-
                 self._append_history({
                     "dt": market_data.get("candle_time"),
                     "event": "UPDATE_SL",
@@ -4586,8 +4598,8 @@ class LiveEngine:
                     "side": pos.get("side"),
                     "price": float(market_data.get("close") or 0),
                     "amount": float(pos.get("amount") or 0),
-                    "sl": float(display["display_sl"]) if display["display_sl"] is not None else None,
-                    "reason": reason_txt[:800],
+                    "sl": float(pos.get("sl")) if pos.get("sl") is not None else None,
+                    "reason": (reason or "TRAILING")[:800],
                     "pos_count": int(len(self.executor.positions or {})),
                     "cash": float(self._last_cash or 0),
                     "equity": float(self._last_equity or 0),
@@ -4597,19 +4609,15 @@ class LiveEngine:
 
             try:
                 if getattr(self, "notifier", None):
-                    lines = [
-                        f"t={market_data.get('candle_time')}",
-                        f"symbol={sym}",
-                        f"side={pos.get('side')}",
-                        f"new_sl={display['display_sl']}",
-                        f"apply_mode={apply_mode}",
-                    ]
-                    if display["mode"] == "next":
-                        lines.append(f"current_sl={display['current_sl']}")
-                        lines.append(f"next_sl={display['next_sl']}")
                     self.notifier.send(
                         title="UPDATE_SL",
-                        lines=lines,
+                        lines=[
+                            f"t={market_data.get('candle_time')}",
+                            f"symbol={sym}",
+                            f"side={pos.get('side')}",
+                            f"new_sl={pos.get('sl')}",
+                            f"apply_mode={apply_mode}",
+                        ],
                     )
             except Exception as e:
                 logger.error(f"UPDATE_SL telegram failed | {sym} | {e}")
@@ -4710,15 +4718,12 @@ class LiveEngine:
                 return default
 
         # ✅ 핵심: manage 직전 1m intrabar 준비
-        # 보유 포지션에 대해서만 1m intrabar를 준비한다.
-        intrabar_prep_syms = sorted(set(pos_keys))
         try:
-            if intrabar_prep_syms:
-                self._prepare_intrabar_1m_live(
-                    symbols=intrabar_prep_syms,
-                    authority_time=authority_time,
-                    lookback_bars=4,
-                )
+            self._prepare_intrabar_1m_live(
+                symbols=list(manage_syms),
+                authority_time=authority_time,
+                lookback_bars=4,
+            )
         except Exception as e:
             logger.error(f"LIVE_INTRABAR_PREP_FAIL | {type(e).__name__}: {e}")
 
@@ -4771,7 +4776,6 @@ class LiveEngine:
                     pass
 
         return current_prices, exit_ct, upd_ct, manage_cnt
-
 
     def _force_mark_to_market_equity_live(self, prices: dict) -> float:
         """

@@ -101,6 +101,73 @@ class RiskControl:
         ex_eq = self._safe_float(ex_eq, 0.0)
         return ex_eq
 
+    def _clamp(self, x: float, lo: float, hi: float) -> float:
+        x = float(x)
+        if x < lo:
+            return lo
+        if x > hi:
+            return hi
+        return x
+
+    def _vol_weight(self, vol_pct: float) -> float:
+        """
+        변동성(%) 기반 비용 정규화 가중치.
+        - vol_pct: 예) SL% (= |entry-sl|/entry) 또는 ATR% 등
+        - vol_ref: 기준 변동성(%) (예: 0.03 = 3%)
+        - k: 강도 (0이면 off)
+        - clamp로 과도한 확대/축소 방지
+        """
+        vol_ref = float(self.risk_cfg.get("vol_ref_pct", 0.03))      # 3%
+        k = float(self.risk_cfg.get("vol_weight_k", 0.5))            # 강도
+        w_min = float(self.risk_cfg.get("vol_weight_min", 0.5))
+        w_max = float(self.risk_cfg.get("vol_weight_max", 1.5))
+
+        if k <= 0:
+            return 1.0
+        if vol_pct <= 0 or (not math.isfinite(vol_pct)):
+            return 1.0
+
+        w = (vol_ref / float(vol_pct)) ** k
+        return self._clamp(w, w_min, w_max)
+
+    def _liquidity_cap_qty(self, entry_price: float, vol_ma: float) -> float:
+        """
+        거래량(유동성) 기반 최대 수량 캡.
+        - vol_ma: TitanStrategy가 만든 vol_ma(rolling mean volume) :contentReference[oaicite:3]{index=3}
+        - dollar_vol(프록시) = entry_price * vol_ma
+        - max_notional = dollar_vol * adv_cap_ratio
+        - qty_cap = max_notional / entry_price
+        """
+        try:
+            ep = self._safe_float(entry_price, 0.0)
+            vma = self._safe_float(vol_ma, 0.0)
+            if ep <= 0 or vma <= 0:
+                return 0.0
+
+            adv_cap_ratio = float((self.risk_cfg or {}).get("adv_cap_ratio", 0.0) or 0.0)  # 0이면 off
+            if adv_cap_ratio <= 0:
+                return 0.0
+
+            dollar_vol = ep * vma
+            if (not math.isfinite(dollar_vol)) or dollar_vol <= 0:
+                return 0.0
+
+            adv_min_dollar_vol = float((self.risk_cfg or {}).get("adv_min_dollar_vol", 0.0) or 0.0)  # 0이면 off
+            if adv_min_dollar_vol > 0 and dollar_vol < adv_min_dollar_vol:
+                return 0.0
+
+            max_notional = dollar_vol * adv_cap_ratio
+            if (not math.isfinite(max_notional)) or max_notional <= 0:
+                return 0.0
+
+            qty_cap = max_notional / ep
+            if (not math.isfinite(qty_cap)) or qty_cap <= 0:
+                return 0.0
+
+            return float(qty_cap)
+        except Exception:
+            return 0.0
+
     # -------------------------
     # Gates
     # -------------------------
@@ -159,19 +226,21 @@ class RiskControl:
         sl_price,
         signal_side,
         atr: float = 0.0,
+        vol_ma: float = 0.0,   # ✅ NEW
     ):
         """
         [Gate 3] Dual-Cap Sizing (Risk vs Margin)
 
-        inputs:
-        - equity: 엔진이 확정한 단일 기준값(라이브: balance 기반 / 백테: executor.equity)
-        - atr: (옵션) SL 최소거리 게이트용
+        - 기본: SL% 기반(손절 손실 동일화)
+        - 추가: 변동성 가중치로 비용(슬리피지/스프레드/임팩트) 정규화 
+        - ✅ 추가2(NEW): 거래량(유동성) 기반 notional cap으로 비용을 더 직접적으로 정규화
         """
         try:
             entry_price = self._safe_float(entry_price, 0.0)
             sl_price = self._safe_float(sl_price, 0.0)
             eq = self._equity_fallback(equity)
             atrv = self._safe_float(atr, 0.0)
+            vma = self._safe_float(vol_ma, 0.0)
 
             if entry_price <= 0 or sl_price <= 0 or eq <= 0:
                 return 0.0
@@ -188,7 +257,7 @@ class RiskControl:
             if not self.check_correlation(side):
                 return 0.0
 
-            # SL distance sanity (NEW): SL이 너무 가까우면 수량이 폭증하므로 차단/완화
+            # SL distance sanity
             price_diff = abs(entry_price - sl_price)
             if price_diff <= 0 or (not math.isfinite(price_diff)):
                 return 0.0
@@ -201,18 +270,27 @@ class RiskControl:
                 if price_diff < (atrv * float(self.min_sl_distance_atr)):
                     return 0.0
 
+            # 변동성(%) 계산: SL% 기본
+            sl_pct = price_diff / entry_price
+            vol_pct = sl_pct
+            if atrv > 0 and math.isfinite(atrv):
+                atr_pct = atrv / entry_price
+                if math.isfinite(atr_pct) and atr_pct > 0:
+                    vol_pct = max(vol_pct, atr_pct)
+
+            # 변동성 가중치
+            vol_w = self._vol_weight(vol_pct)
+
             # Cap A: risk-based
-            risk_money = eq * float(self.risk_per_trade)
+            risk_money = eq * float(self.risk_per_trade) * float(vol_w)
             if risk_money <= 0 or (not math.isfinite(risk_money)):
                 return 0.0
-
             qty_by_risk = risk_money / price_diff
 
-            # Cap B: margin-based (pos margin <= eq * margin_limit_per_pos)
+            # Cap B: margin-based
             target_margin = eq * float(self.margin_limit_per_pos)
             if target_margin <= 0 or (not math.isfinite(target_margin)):
                 return 0.0
-
             qty_by_margin = (target_margin * float(self.leverage)) / entry_price
 
             if (not math.isfinite(qty_by_risk)) or (not math.isfinite(qty_by_margin)):
@@ -222,7 +300,12 @@ class RiskControl:
 
             raw_amount = min(qty_by_risk, qty_by_margin)
 
-            # NEW: notional hard cap (옵션)
+            # ✅ NEW: 거래량(유동성) cap
+            qty_cap = self._liquidity_cap_qty(entry_price, vma)
+            if qty_cap > 0:
+                raw_amount = min(raw_amount, qty_cap)
+
+            # notional hard cap (옵션)
             if float(self.max_notional_per_pos) > 0:
                 max_amt_by_notional = float(self.max_notional_per_pos) / entry_price
                 if math.isfinite(max_amt_by_notional) and max_amt_by_notional > 0:
@@ -235,22 +318,7 @@ class RiskControl:
             if notional < float(self.min_notional):
                 return 0.0
 
-            # precision
-            try:
-                final_amount = self.executor.amount_to_precision(symbol, raw_amount)
-            except Exception:
-                final_amount = raw_amount
+            return float(raw_amount)
 
-            final_amount = self._safe_float(final_amount, 0.0)
-            if final_amount <= 0:
-                return 0.0
-
-            # precision 후 min_notional 재검증
-            if (final_amount * entry_price) < float(self.min_notional):
-                return 0.0
-
-            return float(final_amount)
-
-        except Exception as e:
-            logger.error(f"❌ [RISK ERROR] {symbol}: {e}")
+        except Exception:
             return 0.0

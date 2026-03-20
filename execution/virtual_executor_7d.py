@@ -371,7 +371,7 @@ class VirtualExecutor:
         targets.sort(key=lambda x: x[1], reverse=True)
         return [t[0] for t in targets][:30]  # <-- 항상 list
 
-    def prepare_data(self, symbols, days=30):
+    def prepare_data(self, symbols, days=7):
         # (기존 데이터 다운로드 로직 유지)
         import ccxt
         import time

@@ -62,10 +62,6 @@ These three define the "brain" of Phalanx.
 - live_engine.py
   Real exchange execution.
 
-- main_engine.py
-  Deprecated. Exists for legacy reasons only.
-  Must never be referenced by any new logic.
-
 ----------------------------------------
 
 /execution/
@@ -85,9 +81,6 @@ Top-level scripts:
   Searches for optimal parameters.
   Does NOT validate realism.
 
-- run_param_backtest.py
-  Replays optimize results under realistic constraints.
-
 - backtest_dashboard.py / dashboard.py
   Visualization only. Must not affect logic.
 
@@ -96,12 +89,6 @@ Top-level scripts:
 /utils/
 - data_loader.py
   Historical data fetch & caching.
-
-- history_manager.py
-  Trade history & performance tracking.
-
-- telegram_bot.py
-  Notification only. No trading authority.
 
 ────────────────────────────────────────
 IV. EXECUTION MODES
@@ -112,10 +99,6 @@ Phalanx operates in three time modes:
 1. Optimization Mode
    optimize.py
    → finds statistically strong parameter sets.
-
-2. Validation Mode
-   run_param_backtest.py
-   → tests if optimize results survive realism.
 
 3. Forward Test / Live Mode
    backtest_engine.py (forward) or live_engine.py

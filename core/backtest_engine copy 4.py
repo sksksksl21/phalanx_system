@@ -5,6 +5,7 @@ import logging
 import pandas as pd
 import numpy as np
 import math
+import pandas_ta as ta
 
 # 상위 경로 설정
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +49,7 @@ class BacktestEngine:
         self.cfg = self._load_config()
         self.raw_1m_map = {}    # sym -> 1m raw df
         self.data_1m_map = {}   # sym -> 1m df (필요시 정제)
+        self.raw_daily_map = {} # sym -> 1d raw df (DAILY EMA 주입용)
         self._bar_td = self._infer_bar_timedelta(default_minutes=15)
         self.cooldowns = {}
         self.consecutive_losses = {}
@@ -62,7 +64,7 @@ class BacktestEngine:
 
         # [Safety] 초기 자본금 강제 주입
         if not hasattr(self.executor, 'initial_balance'):
-            self.executor.initial_balance = 10000.0
+            self.executor.initial_balance = 2500.0
         if not hasattr(self.executor, 'cash'):
             self.executor.cash = float(self.executor.initial_balance)
         if not hasattr(self.executor, 'equity'):
@@ -99,6 +101,8 @@ class BacktestEngine:
 
         # MTM Equity Curve CSV 경로 (대시보드용)
         self.equity_curve_file = os.path.join(root_dir, "backtest_equity_curve.csv")
+
+
 
     def _load_config(self):
         if not os.path.exists(self.config_path):
@@ -540,6 +544,287 @@ class BacktestEngine:
         out = [r for r in out if int(r[0]) < int(until_ms)]
         return out
 
+    def _prepare_daily_context(self, symbols):
+        """
+        백테 평가구간(test_days)은 유지하되,
+        DAILY EMA 계산용 1d OHLCV를 별도로 확보한다.
+
+        규칙:
+        - 최소 40일봉 보장
+        - 전략 최소 요구(daily_ema + 5)도 함께 반영
+        - 각 심볼의 15m raw 끝시점 기준으로 과거 1d 구간 fetch
+        """
+        self.raw_daily_map = {}
+
+        if not symbols:
+            logger.warning("[DailyContext] symbols empty.")
+            return self.raw_daily_map
+
+        try:
+            p = getattr(self.titan, "params", None)
+            p = p if isinstance(p, dict) else {}
+        except Exception:
+            p = {}
+
+        try:
+            daily_len = int(p.get("daily_ema", 25) or 25)
+        except Exception:
+            daily_len = 25
+
+        need_days = int(max(40, daily_len + 5))
+        loaded = 0
+
+        stats = {
+            "ok": 0,
+            "skip_no_15m": 0,
+            "skip_fetch_empty": 0,
+            "skip_clean_empty": 0,
+            "fail": 0,
+        }
+
+        for sym in symbols:
+            try:
+                df15 = self.raw_data_map.get(sym)
+                rows_15m = int(len(df15)) if isinstance(df15, pd.DataFrame) else 0
+
+                if df15 is None or df15.empty:
+                    stats["skip_no_15m"] += 1
+                    self._log_daily_context_status(
+                        sym=sym,
+                        status="SKIP_NO_15M",
+                        rows_15m=rows_15m,
+                        rows_1d=0,
+                        need_days=need_days,
+                        reason="raw_15m_empty",
+                    )
+                    continue
+
+                end_dt = pd.Timestamp(df15.index.max()).normalize() + pd.Timedelta(days=1)
+                since_dt = end_dt - pd.Timedelta(days=int(need_days + 5))
+
+                since_ms = int(pd.Timestamp(since_dt).timestamp() * 1000)
+                until_ms = int(pd.Timestamp(end_dt).timestamp() * 1000)
+
+                rows = self._fetch_ohlcv_range(sym, "1d", since_ms, until_ms, limit=1000)
+                if not rows:
+                    stats["skip_fetch_empty"] += 1
+                    self._log_daily_context_status(
+                        sym=sym,
+                        status="SKIP_FETCH_EMPTY",
+                        rows_15m=rows_15m,
+                        rows_1d=0,
+                        need_days=need_days,
+                        start_1d=since_dt,
+                        end_1d=end_dt,
+                        reason="fetch_ohlcv_range_empty",
+                    )
+                    continue
+
+                dfd = pd.DataFrame(
+                    rows,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+
+                dfd["timestamp"] = pd.to_datetime(
+                    dfd["timestamp"], unit="ms", utc=True, errors="coerce"
+                ).dt.tz_convert(None)
+                dfd = dfd.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+
+                for c in ["open", "high", "low", "close", "volume"]:
+                    dfd[c] = pd.to_numeric(dfd[c], errors="coerce")
+
+                dfd = dfd.dropna(subset=["open", "high", "low", "close"])
+                if dfd.empty:
+                    stats["skip_clean_empty"] += 1
+                    self._log_daily_context_status(
+                        sym=sym,
+                        status="SKIP_CLEAN_EMPTY",
+                        rows_15m=rows_15m,
+                        rows_1d=0,
+                        need_days=need_days,
+                        start_1d=since_dt,
+                        end_1d=end_dt,
+                        reason="daily_df_empty_after_clean",
+                    )
+                    continue
+
+                self.raw_daily_map[sym] = dfd
+                loaded += 1
+                stats["ok"] += 1
+
+                self._log_daily_context_status(
+                    sym=sym,
+                    status="OK",
+                    rows_15m=rows_15m,
+                    rows_1d=len(dfd),
+                    need_days=need_days,
+                    start_1d=dfd.index.min(),
+                    end_1d=dfd.index.max(),
+                    reason="loaded",
+                )
+
+            except Exception as e:
+                stats["fail"] += 1
+                logger.warning(f"[DailyContext] {sym} load failed: {e}")
+                self._log_daily_context_status(
+                    sym=sym,
+                    status="FAIL",
+                    rows_15m=0,
+                    rows_1d=0,
+                    need_days=need_days,
+                    reason=str(e),
+                )
+
+        logger.info(
+            f"✅ Daily Context Ready: {loaded}/{len(symbols)} symbols | "
+            f"need_days>={need_days} stats={stats}"
+        )
+        return self.raw_daily_map
+
+
+    def _log_daily_context_status(
+        self,
+        sym: str,
+        status: str,
+        rows_15m: int,
+        rows_1d: int,
+        need_days: int,
+        start_1d=None,
+        end_1d=None,
+        reason: str = "",
+    ):
+        try:
+            logger.info(
+                f"🗓️ DAILY_CTX | {sym} "
+                f"status={status} rows15m={int(rows_15m)} rows1d={int(rows_1d)} "
+                f"need_days>={int(need_days)} range1d={start_1d}~{end_1d} reason={reason}"
+            )
+        except Exception:
+            pass
+
+
+    def _inject_daily_ema_from_daily_map(self, sym: str, ind: pd.DataFrame) -> pd.DataFrame:
+        """
+        엔진이 별도로 받은 1d OHLCV로 DAILY EMA를 계산해 15m indicator df에 주입한다.
+        - lookahead 방지: 일봉 EMA를 1일 shift 후 15m index에 ffill
+        - 충분한 일봉이 없으면 ema_daily_ok=0 유지
+        """
+        if ind is None or not isinstance(ind, pd.DataFrame) or ind.empty:
+            return ind
+
+        out = ind.copy()
+        rows_15m = int(len(out))
+
+        try:
+            p = getattr(self.titan, "params", None)
+            p = p if isinstance(p, dict) else {}
+        except Exception:
+            p = {}
+
+        try:
+            daily_len = int(p.get("daily_ema", 25) or 25)
+        except Exception:
+            daily_len = 25
+
+        need_days = int(max(40, daily_len + 5))
+
+        dfd = getattr(self, "raw_daily_map", {}).get(sym)
+        if dfd is None or dfd.empty:
+            out["ema_daily"] = 0.0
+            out["ema_daily_ok"] = 0
+            self._log_daily_injection_status(
+                sym=sym,
+                status="SKIP_NO_DAILY_CTX",
+                rows_15m=rows_15m,
+                rows_1d=0,
+                need_days=need_days,
+                reason="raw_daily_map_missing",
+            )
+            return out
+
+        dfd = dfd.copy().sort_index()
+        dfd = dfd.dropna(subset=["close"])
+        rows_1d = int(len(dfd))
+
+        if len(dfd) < need_days:
+            out["ema_daily"] = 0.0
+            out["ema_daily_ok"] = 0
+            self._log_daily_injection_status(
+                sym=sym,
+                status="SKIP_SHORT_DAILY",
+                rows_15m=rows_15m,
+                rows_1d=rows_1d,
+                need_days=need_days,
+                reason="insufficient_daily_rows",
+            )
+            return out
+
+        try:
+            dfd["ema_daily"] = ta.ema(dfd["close"], length=daily_len)
+            dfd["ema_daily"] = dfd["ema_daily"].shift(1)  # 확정된 전일 값만 사용
+
+            ema_mapped = dfd["ema_daily"].reindex(out.index, method="ffill")
+            mapped_series = pd.Series(ema_mapped, index=out.index).astype(float)
+
+            mapped_mask = mapped_series.notna()
+            mapped_non_na = int(mapped_mask.sum())
+            first_valid_15m = mapped_series.index[mapped_mask.argmax()] if mapped_non_na > 0 else None
+            last_ema = float(mapped_series[mapped_mask].iloc[-1]) if mapped_non_na > 0 else None
+
+            out["ema_daily"] = mapped_series.fillna(0.0)
+            out["ema_daily_ok"] = 1 if mapped_non_na > 0 else 0
+
+            self._log_daily_injection_status(
+                sym=sym,
+                status="OK" if mapped_non_na > 0 else "FAIL_NO_MAPPED_VALUES",
+                rows_15m=rows_15m,
+                rows_1d=rows_1d,
+                need_days=need_days,
+                mapped_non_na=mapped_non_na,
+                first_valid_15m=first_valid_15m,
+                last_ema=last_ema,
+                reason="engine_daily_injected" if mapped_non_na > 0 else "mapped_non_na_zero",
+            )
+            return out
+
+        except Exception as e:
+            logger.warning(f"[DailyContext] {sym} ema inject failed: {e}")
+            out["ema_daily"] = 0.0
+            out["ema_daily_ok"] = 0
+            self._log_daily_injection_status(
+                sym=sym,
+                status="FAIL_EXCEPTION",
+                rows_15m=rows_15m,
+                rows_1d=rows_1d,
+                need_days=need_days,
+                reason=str(e),
+            )
+            return out
+
+
+
+    def _log_daily_injection_status(
+        self,
+        sym: str,
+        status: str,
+        rows_15m: int,
+        rows_1d: int,
+        need_days: int,
+        mapped_non_na: int = 0,
+        first_valid_15m=None,
+        last_ema=None,
+        reason: str = "",
+    ):
+        try:
+            logger.info(
+                f"🧪 DAILY_INJECT | {sym} "
+                f"status={status} rows15m={int(rows_15m)} rows1d={int(rows_1d)} "
+                f"need_days>={int(need_days)} mapped_non_na={int(mapped_non_na)} "
+                f"first_valid_15m={first_valid_15m} last_ema={last_ema} reason={reason}"
+            )
+        except Exception:
+            pass
+
 
     def _load_intrabar_1m(self, targets):
         """
@@ -628,72 +913,83 @@ class BacktestEngine:
     # 1. Data Preparation Layer
     # =========================================================
     def prepare_data(self, symbols=None):
-        """
-        - ✅ UF Step2 결과 JSON의 "symbols"만 읽어서 targets로 사용
-        - ✅ raw_data_map 캐시가 있어도 무조건 다시 다운로드(재로드)
-        - ✅ intrabar(1m)도 같은 symbols로 즉시 로드 (pickle 금지)
-        """
-        logger.info("📥 [Data Loader] Fetching Historical Data... (FORCE REFRESH)")
+            """
+            - ✅ universe.json 우선 사용 (root_dir/universe.json)
+            - ✅ 파일 없거나 비정상이면 executor.get_top_targets() 폴백
+            - ✅ raw_data_map 캐시가 있어도 무조건 다시 다운로드(재로드)
+            - ✅ intrabar(1m)도 같은 symbols로 즉시 로드 (pickle 금지)
+            - ✅ DAILY EMA용 1d OHLCV는 별도로 확보 (평가구간과 분리)
+            """
+            logger.info("📥 [Data Loader] Fetching Historical Data... (FORCE REFRESH)")
 
-        # ---------------------------------------------------------
-        # 1) 타겟 심볼 결정 (외부 주입 > UF Step2 JSON > 폴백)
-        # ---------------------------------------------------------
-        if symbols:
-            targets = symbols
-        else:
-            uf_step2_path = r"C:\Quantops2\Phalanx_System\universe_filter\output\universe_step2.json"
-            targets = []
-
-            try:
-                if os.path.exists(uf_step2_path):
-                    with open(uf_step2_path, "r", encoding="utf-8") as f:
-                        obj = json.load(f) or {}
-                    if isinstance(obj, dict) and isinstance(obj.get("symbols", None), list):
-                        targets = obj.get("symbols", [])
-            except Exception:
+            # ---------------------------------------------------------
+            # 1) 타겟 심볼 결정 (외부 주입 > universe.json > 폴백)
+            # ---------------------------------------------------------
+            if symbols:
+                targets = symbols
+            else:
                 targets = []
 
-            if not targets:
-                targets = self.executor.get_top_targets()
+                # (A) universe.json 로드
+                uni_path = os.path.join(self.root_dir, "universe.json")
+                try:
+                    if os.path.exists(uni_path):
+                        with open(uni_path, "r", encoding="utf-8") as f:
+                            obj = json.load(f) or {}
 
-        # ---------------------------------------------------------
-        # 2) 블랙리스트 제거 (기존 유지)
-        # ---------------------------------------------------------
-        filtered_targets = []
-        for sym in targets:
-            clean_sym = sym.split(":")[0]
-            if clean_sym in self.titan.blacklist or sym in self.titan.blacklist:
-                continue
-            filtered_targets.append(sym)
-        targets = filtered_targets
+                        # 지원 포맷:
+                        # 1) {"universe":[...]}  (너가 만든 포맷)
+                        # 2) {"symbols":[...]}   (호환)
+                        if isinstance(obj, dict) and isinstance(obj.get("universe", None), list):
+                            targets = obj.get("universe", []) or []
+                        elif isinstance(obj, dict) and isinstance(obj.get("symbols", None), list):
+                            targets = obj.get("symbols", []) or []
+                except Exception:
+                    targets = []
 
-        # ---------------------------------------------------------
-        # 3) 강제 재다운로드 (엔진 days 권위 반영)
-        # ---------------------------------------------------------
-        try:
-            raw_data_map = self.executor.prepare_data(targets, days=int(self.test_days))
-        except TypeError:
-            raw_data_map = self.executor.prepare_data(targets)
+                # (B) 폴백: 거래소/익스큐터 top targets
+                if not targets:
+                    targets = self.executor.get_top_targets()
 
-        if not raw_data_map:
-            logger.error("❌ No Data Loaded.")
-            return {}
+            # ---------------------------------------------------------
+            # 2) 블랙리스트 제거 (기존 유지)
+            # ---------------------------------------------------------
+            filtered_targets = []
+            for sym in targets:
+                clean_sym = sym.split(":")[0]
+                if clean_sym in self.titan.blacklist or sym in self.titan.blacklist:
+                    continue
+                filtered_targets.append(sym)
+            targets = filtered_targets
 
-        sorted_symbols = sorted(list(raw_data_map.keys()))
+            # ---------------------------------------------------------
+            # 3) 강제 재다운로드 (엔진 days 권위 반영)
+            # ---------------------------------------------------------
+            try:
+                raw_data_map = self.executor.prepare_data(targets, days=int(self.test_days))
+            except TypeError:
+                raw_data_map = self.executor.prepare_data(targets)
 
-        # ✅ 1) raw_data_map 먼저 확정
-        self.raw_data_map = {sym: raw_data_map[sym] for sym in sorted_symbols}
+            if not raw_data_map:
+                logger.error("❌ No Data Loaded.")
+                return {}
 
-        # ✅ 2) symbols는 "확정된 raw_data_map" 기준으로 갱신
-        self.symbols = list(self.raw_data_map.keys())
+            sorted_symbols = sorted(list(raw_data_map.keys()))
 
-        # ✅ 3) intrabar도 같은 symbols로 로드 (targets 빈 리스트 문제 제거)
-        self._load_intrabar_1m(self.symbols)
+            # ✅ 1) raw_data_map 먼저 확정
+            self.raw_data_map = {sym: raw_data_map[sym] for sym in sorted_symbols}
 
-        logger.info(f"✅ Raw Data Ready: {len(self.raw_data_map)} symbols loaded.")
-        return self.raw_data_map
+            # ✅ 2) symbols는 "확정된 raw_data_map" 기준으로 갱신
+            self.symbols = list(self.raw_data_map.keys())
 
+            # ✅ 3) DAILY EMA용 1d 컨텍스트 별도 로드
+            self._prepare_daily_context(self.symbols)
 
+            # ✅ 4) intrabar도 같은 symbols로 로드
+            self._load_intrabar_1m(self.symbols)
+
+            logger.info(f"✅ Raw Data Ready: {len(self.raw_data_map)} symbols loaded.")
+            return self.raw_data_map
 
 
     def rebuild_indicators(self):
@@ -701,6 +997,7 @@ class BacktestEngine:
         - dropna()는 '필수 컬럼 subset' 기준으로만 적용한다.
         - 워밍업(warmup)은 각 필수 컬럼의 첫 유효시점 중 '가장 늦은 시점'을 사용한다.
         - 심볼별 warmup으로 슬라이스
+        - DAILY EMA는 엔진이 별도 1d 데이터로 계산해 주입한다.
         """
         self.data_map = {}
 
@@ -712,21 +1009,58 @@ class BacktestEngine:
         temp_map = {}
         warmup_map = {}
 
+        indicator_stats = {
+            "ok": 0,
+            "fail_calc": 0,
+            "missing_required": 0,
+            "all_nan_required": 0,
+            "bad_required_cols": 0,
+            "daily_ready": 0,
+            "daily_not_ready": 0,
+            "slice_empty": 0,
+            "drop_all_nan": 0,
+            "slice_fail": 0,
+        }
+
         for sym, df in self.raw_data_map.items():
             try:
                 ind = self.titan.calculate_indicators(sym, df.copy())
 
+                # ✅ 엔진 주도 DAILY EMA 주입 (전략 내부 15m-resample 결과를 override)
+                ind = self._inject_daily_ema_from_daily_map(sym, ind)
+
+                if "ema_daily" not in ind.columns or "ema_daily_ok" not in ind.columns:
+                    logger.warning(f"[Indicator] {sym} daily columns missing after injection.")
+                    indicator_stats["daily_not_ready"] += 1
+                else:
+                    try:
+                        daily_ok_last = int(ind["ema_daily_ok"].iloc[-1])
+                    except Exception:
+                        daily_ok_last = 0
+
+                    if daily_ok_last == 1:
+                        indicator_stats["daily_ready"] += 1
+                    else:
+                        indicator_stats["daily_not_ready"] += 1
+                        logger.warning(
+                            f"[Indicator] {sym} daily not ready after injection | "
+                            f"rows={len(ind)} last_ema_daily_ok={daily_ok_last}"
+                        )
+
                 missing = [c for c in self.required_cols if c not in ind.columns]
                 if missing:
+                    indicator_stats["missing_required"] += 1
                     logger.warning(f"[Indicator] {sym} missing required cols: {missing}")
                     continue
 
                 if ind[self.required_cols].isna().all().all():
+                    indicator_stats["all_nan_required"] += 1
                     logger.warning(f"[Indicator] {sym} required columns all-NaN (pre-slice).")
                     continue
 
                 bad_cols = [c for c in self.required_cols if ind[c].isna().all()]
                 if bad_cols:
+                    indicator_stats["bad_required_cols"] += 1
                     logger.warning(f"[Indicator] {sym} has all-NaN required cols (pre-slice): {bad_cols}")
                     continue
 
@@ -747,6 +1081,7 @@ class BacktestEngine:
                 warmup_map[sym] = sym_warmup
 
             except Exception as e:
+                indicator_stats["fail_calc"] += 1
                 logger.warning(f"[Indicator] {sym} indicator failed: {e}")
 
         for sym, ind in temp_map.items():
@@ -755,20 +1090,41 @@ class BacktestEngine:
                 sliced = ind.iloc[sym_warmup:].copy()
 
                 if len(sliced) == 0:
-                    logger.warning(f"[Indicator] {sym} empty after slice")
+                    indicator_stats["slice_empty"] += 1
+                    logger.warning(f"[Indicator] {sym} empty after slice | warmup={sym_warmup}")
                     continue
 
                 sliced = sliced.dropna(subset=self.required_cols)
                 if len(sliced) == 0:
+                    indicator_stats["drop_all_nan"] += 1
                     logger.warning(f"[Indicator] {sym} all NaN after drop (required subset)")
                     continue
 
                 self.data_map[sym] = sliced
+                indicator_stats["ok"] += 1
+
+                try:
+                    daily_ok_last = int(sliced["ema_daily_ok"].iloc[-1]) if "ema_daily_ok" in sliced.columns else -1
+                    ema_daily_last = float(sliced["ema_daily"].iloc[-1]) if "ema_daily" in sliced.columns else None
+                except Exception:
+                    daily_ok_last = -1
+                    ema_daily_last = None
+
+                logger.info(
+                    f"🧩 INDICATOR_READY | {sym} "
+                    f"rows_in={len(ind)} warmup={sym_warmup} rows_out={len(sliced)} "
+                    f"daily_ok_last={daily_ok_last} ema_daily_last={ema_daily_last}"
+                )
 
             except Exception as e:
+                indicator_stats["slice_fail"] += 1
                 logger.warning(f"[Indicator] {sym} slice failed: {e}")
 
-        logger.info(f"Indicators Ready: {len(self.data_map)} symbols processed.")
+        logger.info(
+            f"Indicators Ready: {len(self.data_map)} symbols processed. "
+            f"stats={indicator_stats}"
+        )
+
 
     def _log_csv(self, dt, sym, side, type_note, price, amt, pnl, reason):
         cash = float(getattr(self.executor, "cash", 0.0))
@@ -818,7 +1174,61 @@ class BacktestEngine:
         except Exception:
             return {}
 
+    def _backtest_debug_enabled(self) -> bool:
+        """
+        PositionMonitor 내부 디버그 이벤트를 backtest_history.csv에 남길지 여부
+        기본값 True
+        """
+        try:
+            return bool((self.cfg.get("system_settings", {}) or {}).get("backtest_debug_to_history", True))
+        except Exception:
+            return True
 
+    def _make_backtest_debug_sink(self, sym: str, pos: dict, candle_t):
+        """
+        PositionMonitor -> BacktestEngine debug sink
+        EM_* 이벤트를 backtest_history.csv로 흘려보낸다.
+        """
+        if not self._backtest_debug_enabled():
+            return None
+
+        side = str((pos or {}).get("side", "")).upper().strip()
+
+        def _fmt(v):
+            try:
+                if v is None:
+                    return "None"
+                if isinstance(v, float):
+                    if not math.isfinite(v):
+                        return "None"
+                    return f"{v:.10g}"
+                return str(v)
+            except Exception:
+                return "None"
+
+        def _compact(payload: dict) -> str:
+            parts = []
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    parts.append(f"{k}={_fmt(v)}")
+            return " | ".join(parts)[:800]
+
+        def _sink(stage: str, payload: dict = None):
+            try:
+                self._log_csv(
+                    candle_t,
+                    sym,
+                    side,
+                    f"EM_{str(stage).upper()}",
+                    0.0,
+                    float((pos or {}).get("amount", 0.0) or 0.0),
+                    0.0,
+                    _compact(payload or {}),
+                )
+            except Exception:
+                pass
+
+        return _sink
 
 
     # =========================================================
@@ -945,9 +1355,24 @@ class BacktestEngine:
             logger.error(f"❌ Not enough simulation steps after warmup: {len(sim_times)}")
             return
 
+        scan_stats = {
+            "steps": 0,
+            "skip_in_position": 0,
+            "skip_cooldown": 0,
+            "skip_blacklist": 0,
+            "skip_no_slice": 0,
+            "skip_short_slice": 0,
+            "ctx_daily_not_ready": 0,
+            "analyze_no_signal": 0,
+            "signal_long": 0,
+            "signal_short": 0,
+            "candidate_ct": 0,
+        }
+
         for current_time in sim_times:
             # ✅ [ADD] step counter (pending TTL용)
             self._step_i = int(getattr(self, "_step_i", 0)) + 1
+            scan_stats["steps"] += 1
 
             current_rows = {}
             current_prices = {}
@@ -967,10 +1392,6 @@ class BacktestEngine:
             self._sweep_pending_entry_orders(current_time, current_rows, current_prices)
 
             # Step 1: 포지션 관리
-            # -------------------------------------------------
-            # ✅ manage POST (LIVE와 동일)
-            # - 같은 current_time 기준으로 신규 포지션 즉시 SL 반영/검사
-            # -------------------------------------------------
             for sym in fixed_symbols:
                 if sym not in self.executor.positions:
                     continue
@@ -981,6 +1402,7 @@ class BacktestEngine:
             candidates = []
             for sym in fixed_symbols:
                 if sym in self.executor.positions:
+                    scan_stats["skip_in_position"] += 1
                     continue
 
                 curr_row = current_rows[sym]
@@ -990,36 +1412,57 @@ class BacktestEngine:
                 # 쿨다운
                 if sym in self.cooldowns:
                     if current_time < self.cooldowns[sym]:
+                        scan_stats["skip_cooldown"] += 1
                         continue
                     else:
                         del self.cooldowns[sym]
 
                 if clean_sym in self.titan.blacklist:
+                    scan_stats["skip_blacklist"] += 1
                     continue
+
+                # 현재 봉 기준 daily 컨텍스트 준비 여부 관측만 한다. 동작은 바꾸지 않는다.
+                try:
+                    daily_ok_now = int(curr_row.get("ema_daily_ok", 0) or 0)
+                    if daily_ok_now != 1:
+                        scan_stats["ctx_daily_not_ready"] += 1
+                except Exception:
+                    scan_stats["ctx_daily_not_ready"] += 1
 
                 # ✅ Titan9 봉인형 슬라이스(=LIVE와 동일)
                 past_data = self._slice_for_t9(df, current_time)
                 if past_data is None:
+                    scan_stats["skip_no_slice"] += 1
                     continue
 
                 # min_len 미만이면 스킵(계약 준수)
                 if len(past_data) < int(self._t9_min_len()):
+                    scan_stats["skip_short_slice"] += 1
                     continue
 
                 signal, sl_price, _tp_price = self.titan.analyze(sym, past_data)
 
-
                 if signal:
                     score = float(curr_row.get('adx', 0))
+                    sig_norm = str(signal).upper()
+                    if sig_norm == "LONG":
+                        scan_stats["signal_long"] += 1
+                    elif sig_norm == "SHORT":
+                        scan_stats["signal_short"] += 1
+
+                    scan_stats["candidate_ct"] += 1
+
                     candidates.append({
                         'score': score,
                         'sym': sym,
                         'signal': signal,
                         'sl': sl_price,
                         'row': curr_row,
-                        'atr_ratio': float(curr_row.get("atr_ratio", 0.0) or 0.0),  # ✅ ADD
+                        'atr_ratio': float(curr_row.get("atr_ratio", 0.0) or 0.0),
                         'prices': current_prices
                     })
+                else:
+                    scan_stats["analyze_no_signal"] += 1
 
             candidates.sort(key=lambda x: x['score'], reverse=True)
 
@@ -1034,11 +1477,11 @@ class BacktestEngine:
                     cand['prices']
                 )
 
-            
-
             # MTM 최종 업데이트 (강제 MTM)
             self._sync_equity(current_prices)
             self.executor.equity_curve.append({'dt': current_time, 'equity': float(self.executor.equity)})
+
+        logger.info(f"🧪 BACKTEST_SCAN_STATS | {scan_stats}")
 
         # Equity curve save (이하 기존 그대로)
         try:
@@ -1062,7 +1505,6 @@ class BacktestEngine:
             except Exception as e:
                 logger.error(f"❌ Report Error: {e}")
 
-        # core/backtest_engine.py
 
     def _process_entry(self, sym, signal, sl, curr_row, current_prices: dict):
         # ✅ 0) signal 정규화
@@ -1082,7 +1524,7 @@ class BacktestEngine:
         if sym in peo:
             return
 
-        # ✅ anchor = signal 봉의 close
+        # ✅ anchor = signal 봉의 close (LIVE: 확정봉 close 기준)
         try:
             anchor = float(curr_row.get("close"))
             if (not math.isfinite(anchor)) or anchor <= 0:
@@ -1100,16 +1542,6 @@ class BacktestEngine:
         except Exception:
             entry_atr = None
 
-        # ✅ NEW: entry_vol_ma = signal 봉의 vol_ma (거래량 MA)
-        entry_vol_ma = None
-        try:
-            vv = curr_row.get("vol_ma", None)
-            entry_vol_ma = float(vv) if vv is not None else None
-            if entry_vol_ma is not None and ((not math.isfinite(entry_vol_ma)) or entry_vol_ma <= 0):
-                entry_vol_ma = None
-        except Exception:
-            entry_vol_ma = None
-
         alpha = float(self._entry_alpha_atr())
         atr_for_offset = float(entry_atr or 0.0)
         if (not math.isfinite(atr_for_offset)) or atr_for_offset < 0:
@@ -1124,23 +1556,14 @@ class BacktestEngine:
         if (not math.isfinite(limit_price)) or limit_price <= 0:
             limit_price = anchor
 
-        # ✅ sizing: 주문가(limit_price) vs SL 기준 + atr/vol_ma 전달
+        # ✅ sizing은 LIVE와 동일하게 "주문가(limit_price) vs SL" 기준
         self._sync_equity(current_prices)
         current_equity = float(getattr(self.executor, "equity", self.executor.cash))
-
-        amount = self.risk_ctrl.calculate_entry_size(
-            sym,
-            float(limit_price),
-            current_equity,
-            sl,
-            sig,
-            float(entry_atr or 0.0),
-            float(entry_vol_ma or 0.0),
-        )
+        amount = self.risk_ctrl.calculate_entry_size(sym, float(limit_price), current_equity, sl, sig)
         if amount <= 0:
             return
 
-        # 이하 로직은 그대로...
+        # ✅ executor에 limit 오더 생성(등록)
         side_ccxt = "buy" if sig == "LONG" else "sell"
         res = None
         if hasattr(self.executor, "create_limit_order"):
@@ -1149,22 +1572,24 @@ class BacktestEngine:
         if not oid:
             return
 
+        # ✅ pending에 등록: 다음 봉 1개 동안 체결 판정 후, 그 다음 봉 시작에 만료
         step_i = int(getattr(self, "_step_i", 0))
         peo[sym] = {
             "order_id": str(oid),
             "signal_side": sig,
             "amount": float(amount),
             "sl": float(sl) if sl is not None else None,
-            "signal_time": curr_row.name,
+            "signal_time": curr_row.name,          # 라벨은 신호봉 시간
             "anchor_close": float(anchor),
             "alpha": float(alpha),
             "limit_price": float(limit_price),
             "entry_atr": float(entry_atr) if entry_atr is not None else None,
             "created_i": int(step_i),
-            "expire_i": int(step_i) + 2,
+            "expire_i": int(step_i) + 2,          # ✅ "다음 봉(1개)" 동안 체결 판정 후, 그 다음 봉 시작에 만료
         }
         self.pending_entry_orders = peo
 
+        # 로그(주문 생성)
         try:
             self._log_csv(
                 curr_row.name, sym, sig,
@@ -1176,7 +1601,6 @@ class BacktestEngine:
             )
         except Exception:
             pass
-
 
     def _process_existing_position(self, sym, curr_row, new_signal, apply_mode: str = "next"):
         pos = self.executor.positions[sym]
@@ -1282,6 +1706,13 @@ class BacktestEngine:
         adx = curr_row.get("adx", 0.0)
         adx = _safe_float(adx, 0.0)
 
+        # ✅ [ADD] Backtest debug sink
+        debug_sink = self._make_backtest_debug_sink(
+            sym=sym,
+            pos=pos,
+            candle_t=curr_row.name,
+        )
+
         market_data = {
             "close": close,
             "high": high,
@@ -1290,6 +1721,8 @@ class BacktestEngine:
             "st_val": st_val,
             "adx": adx,
             "df": hist_df,
+            "candle_time": str(curr_row.name),
+            "debug_sink": debug_sink,
         }
 
         # -----------------------------
@@ -1318,7 +1751,6 @@ class BacktestEngine:
                 )
             except Exception:
                 pass
-
 
         # -----------------------------
         # 5) SL 갱신 + trail_sl 저장/갱신 (핵심 수정)
@@ -1363,7 +1795,6 @@ class BacktestEngine:
                 pass
             return
 
-
         elif action == "EXIT":
             self._execute_exit(sym, pos, exec_price, reason, curr_row.name)
             return
@@ -1386,6 +1817,9 @@ class BacktestEngine:
             base = close
             flip_price = base - slippage if pos.get("side", "").upper() == "LONG" else base + slippage
             self._execute_exit(sym, pos, flip_price, "SIGNAL_FLIP", curr_row.name)
+
+
+
 
     def _execute_exit(self, sym, pos, price, reason, dt):
         amount = float(pos['amount'])
@@ -1435,8 +1869,248 @@ class BacktestEngine:
         self.executor.history.append({'dt': dt, 'sym': sym, 'type': 'EXIT', 'pnl': net_pnl, 'reason': reason})
 
 
+    def _get_universe_export_path(self, out_path: str = None) -> str:
+        """
+        universe.json 저장 경로 결정
+        우선순위:
+        1) 인자 out_path
+        2) config: system_settings.universe_export_path
+        3) <root_dir>/universe.json
+        """
+        import os
+
+        path = out_path
+        if not path:
+            try:
+                path = (self.cfg.get("system_settings", {}) or {}).get("universe_export_path", None)
+            except Exception:
+                path = None
+
+        if not path:
+            path = os.path.join(self.root_dir, "universe2.json")
+
+        try:
+            if not os.path.isabs(path):
+                path = os.path.join(self.root_dir, path)
+        except Exception:
+            pass
+
+        return path
+
+
+    def _collect_symbol_stats_from_backtest_log(self) -> dict:
+        """
+        backtest_history.csv(=self.log_file)에서 EXIT만 집계하여 심볼별 성과 산출
+        - CSV가 reason 컬럼에 콤마가 섞여도 깨지지 않게 split(',', 9)로 파싱
+        반환:
+        {sym: {"trades":int,"wins":int,"losses":int,"pnl_total":float,"avg_pnl":float,"win_rate":float,"profit_factor":float}}
+        """
+        import os
+        import math
+
+        path = getattr(self, "log_file", None) or ""
+        if (not path) or (not os.path.exists(path)):
+            return {}
+
+        raw = {}  # sym -> accumulator
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                _ = next(f, None)  # header skip
+                for line in f:
+                    line = (line or "").strip()
+                    if not line:
+                        continue
+
+                    parts = line.split(",", 9)  # 10 columns max
+                    if len(parts) < 9:
+                        continue
+
+                    # Datetime,Symbol,Side,Type,Price,Amount,PnL,Cash,Equity,Reason
+                    # reason는 parts[9]에 통째로 들어감(있으면)
+                    try:
+                        sym = str(parts[1]).strip()
+                        typ = str(parts[3]).strip()
+                    except Exception:
+                        continue
+
+                    if not sym or typ != "EXIT":
+                        continue
+
+                    try:
+                        pnl = float(parts[6])
+                        if not math.isfinite(pnl):
+                            continue
+                    except Exception:
+                        continue
+
+                    acc = raw.get(sym)
+                    if not acc:
+                        acc = {
+                            "trades": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "pnl_total": 0.0,
+                            "pnl_win": 0.0,
+                            "pnl_loss": 0.0,  # 음수 누적
+                        }
+                        raw[sym] = acc
+
+                    acc["trades"] += 1
+                    acc["pnl_total"] += pnl
+                    if pnl > 0:
+                        acc["wins"] += 1
+                        acc["pnl_win"] += pnl
+                    else:
+                        acc["losses"] += 1
+                        acc["pnl_loss"] += pnl
+        except Exception:
+            return {}
+
+        out = {}
+        for sym, acc in raw.items():
+            t = int(acc["trades"] or 0)
+            if t <= 0:
+                continue
+
+            wins = int(acc["wins"] or 0)
+            losses = int(acc["losses"] or 0)
+            pnl_total = float(acc["pnl_total"] or 0.0)
+            avg_pnl = pnl_total / t if t > 0 else 0.0
+            win_rate = wins / t if t > 0 else 0.0
+
+            pnl_win = float(acc["pnl_win"] or 0.0)
+            pnl_loss = float(acc["pnl_loss"] or 0.0)  # 음수 or 0
+            if pnl_loss < 0:
+                profit_factor = pnl_win / abs(pnl_loss) if abs(pnl_loss) > 0 else float("inf")
+            else:
+                profit_factor = float("inf") if pnl_win > 0 else 0.0
+
+            out[sym] = {
+                "trades": t,
+                "wins": wins,
+                "losses": losses,
+                "pnl_total": float(pnl_total),
+                "avg_pnl": float(avg_pnl),
+                "win_rate": float(win_rate),
+                "profit_factor": float(profit_factor),
+            }
+
+        return out
+
+
+    def export_universe_json(self, top_n: int = None, min_trades: int = None, out_path: str = None) -> dict:
+        """
+        백테스트 결과(로그)로 universe.json 생성/저장
+
+        기본 규칙(결정론):
+        - EXIT 기준 심볼별 pnl_total 내림차순
+        - 동률 타이브레이커: profit_factor, win_rate, trades, 심볼명 오름차순
+        - min_trades 미만 심볼은 제외(부족하면 trades>=1에서 다시 채움)
+        - 저장 포맷: {"universe":[...], "meta":{...}}
+        (BacktestEngine._get_universe_from_json이 {"universe":[...]}를 바로 읽을 수 있음)
+        """
+        import os
+        import json
+        import math
+        from datetime import datetime, timezone
+
+        # defaults
+        if top_n is None:
+            try:
+                top_n = int((self.cfg.get("system_settings", {}) or {}).get("universe_size", 24) or 24)
+            except Exception:
+                top_n = 24
+        if top_n <= 0:
+            top_n = 24
+
+        if min_trades is None:
+            try:
+                min_trades = int((self.cfg.get("system_settings", {}) or {}).get("universe_min_trades", 3) or 3)
+            except Exception:
+                min_trades = 3
+        if min_trades < 0:
+            min_trades = 0
+
+        stats = self._collect_symbol_stats_from_backtest_log()
+
+        def _pf_key(x):
+            # inf를 매우 큰 값으로 정렬키화
+            try:
+                v = float(x)
+                if math.isfinite(v):
+                    return v
+                return 1e18
+            except Exception:
+                return 0.0
+
+        # 1차 후보: min_trades 충족
+        primary = [s for s, st in stats.items() if int(st.get("trades", 0)) >= int(min_trades)]
+        # 성과 없는 심볼(거래 0)은 이미 없음
+        def _sort_key(sym):
+            st = stats.get(sym, {}) or {}
+            return (
+                -float(st.get("pnl_total", 0.0) or 0.0),
+                -_pf_key(st.get("profit_factor", 0.0)),
+                -float(st.get("win_rate", 0.0) or 0.0),
+                -int(st.get("trades", 0) or 0),
+                str(sym),
+            )
+
+        primary_sorted = sorted(primary, key=_sort_key)
+        selected = primary_sorted[:top_n]
+
+        # 부족하면 trades>=1 풀에서 채움
+        if len(selected) < top_n:
+            pool = [s for s, st in stats.items() if int(st.get("trades", 0)) >= 1 and s not in set(selected)]
+            pool_sorted = sorted(pool, key=_sort_key)
+            need = top_n - len(selected)
+            selected.extend(pool_sorted[:need])
+
+        # 저장
+        path = self._get_universe_export_path(out_path)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+
+        meta = {
+            "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "days": int(getattr(self, "test_days", 0) or 0),
+            "top_n": int(top_n),
+            "min_trades": int(min_trades),
+            "source_log": os.path.basename(getattr(self, "log_file", "backtest_history.csv") or "backtest_history.csv"),
+            "metric": "pnl_total(EXIT net_pnl)",
+        }
+
+        payload = {
+            "universe": list(selected),
+            "meta": meta,
+            # 필요하면 아래 주석 해제: 선택된 심볼의 요약 통계도 같이 저장
+            "stats": {s: stats.get(s, {}) for s in selected},
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # 실패해도 시스템이 죽지 않게 dict만 반환
+            return payload
+
+        return payload
+
+
+    def run_and_export_universe(self, show_report: bool = False, universe_size: int = None, min_trades: int = None, out_path: str = None) -> dict:
+        """
+        기존 run()은 그대로 두고,
+        백테스트 수행 후 universe.json을 반드시 생성하는 래퍼.
+        """
+        self.run(show_report=show_report)
+        return self.export_universe_json(top_n=universe_size, min_trades=min_trades, out_path=out_path)
+
+
+
 if __name__ == "__main__":
     engine = BacktestEngine(days=7)
     engine.prepare_data()
     engine.rebuild_indicators()
-    engine.run(show_report=True)
+    engine.run_and_export_universe(show_report=True)
